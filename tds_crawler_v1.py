@@ -327,14 +327,52 @@ def translation_info(url: str) -> tuple[str, str, list[str]]:
     guesses: list[str] = []
     folder = p.path.rsplit("/", 1)[0]
     if base != stem:
-        for name in (base, base + "-EN", base + "_EN", base + " - EN", base + " EN"):
+        for name in (base, base + "-EN", base + " - EN"):
             guesses.append(f"{p.scheme}://{p.netloc}{folder}/{quote(name)}.pdf")
     if loc_idx is not None:
-        for en in ("en", "en-us", "en-gb"):
+        for en in ("en", "en-us"):
             sg = list(segs)
             sg[loc_idx] = en
             guesses.append(f"{p.scheme}://{p.netloc}{'/'.join(sg)}")
     return lang, match_key(base), list(dict.fromkeys(g for g in guesses if canon_url(g) != canon_url(url)))
+
+
+ENGLISH_NAME_SUFFIXES = ("_english", "_en", "-en", "_EN", "-EN")
+
+
+def _name_url(path: str) -> str:
+    return "file://local/" + quote(Path(path).name)
+
+
+def name_lang(path: str) -> str:
+    """Language code implied by a file name ('X - CN.pdf' -> 'zh'), else ''."""
+    return translation_info(_name_url(path))[0]
+
+
+def foreign_key(path: str) -> str:
+    """Match key of the English twin we'd expect for a (possibly suffixed) foreign file name."""
+    lang, key, _ = translation_info(_name_url(path))
+    return key if lang else match_key(Path(path).stem)
+
+
+def english_url_guesses(url: str) -> list[str]:
+    """Likely URLs of the English version of a foreign document: suffix removed / -EN / _english /
+    /en/ folder instead of /zh/ ... (works for names with or without a language suffix)."""
+    lang, _, guesses = translation_info(url)
+    p = urlparse(url)
+    stem = stem_of(url)
+    base = stem
+    m = TRANSLATION_CODE_RE.match(stem) or TRANSLATION_WORD_RE.match(stem)
+    if m:
+        base = m.group("base").rstrip(" _-.")
+    folder = p.path.rsplit("/", 1)[0]
+    out = list(guesses)
+    for sfx in ENGLISH_NAME_SUFFIXES:
+        out.append(f"{p.scheme}://{p.netloc}{folder}/{quote(base + sfx)}.pdf")
+    if base != stem:
+        out.append(f"{p.scheme}://{p.netloc}{folder}/{quote(base)}.pdf")
+    me = canon_url(url)
+    return list(dict.fromkeys(canon_url(g) for g in out if canon_url(g) and canon_url(g) != me))
 
 
 ENGLISH_STOPWORDS = {"the", "and", "of", "for", "with", "to", "in", "is", "are", "this", "that", "by",
@@ -356,10 +394,12 @@ def detect_language(text: str) -> str:
     en_hits = sum(1 for w in words if w in ENGLISH_STOPWORDS)
     counts = {"ja": len(re.findall(r"[\u3040-\u30ff]", text)), "ko": len(re.findall(r"[\uac00-\ud7af]", text)),
               "zh": len(re.findall(r"[\u4e00-\u9fff]", text)), "ru": len(re.findall(r"[\u0400-\u04ff]", text))}
-    if counts["ja"] > 20:
+    top = max(counts.values())
+    if counts["ja"] > 20 or (counts["ja"] >= 8 and en_hits < 5):
         script = "ja"
     else:
-        script = max(counts, key=counts.get) if max(counts.values()) > 30 else ""
+        # plenty of CJK/Cyrillic, or a little of it with hardly any English words around it
+        script = max(counts, key=counts.get) if top > 30 or (top >= 8 and en_hits < 5) else ""
     if script:
         bilingual = en_hits >= 10 or (len(words) >= 40 and en_hits >= 5)
         return f"{script}+en" if bilingual else script
@@ -1124,7 +1164,7 @@ def _english_links(db: DB, vendor: Vendor) -> dict[str, sqlite3.Row]:
 
 
 def _add_english_guesses(db: DB, vendor: Vendor, row) -> list[str]:
-    _, _, guesses = translation_info(row["url"])
+    guesses = english_url_guesses(row["url"])
     for g in guesses:
         db.execute("INSERT OR IGNORE INTO pdf_links(url, vendor, found_on, anchor, doc_type, first_seen, lang, "
                    "english_of) VALUES (?,?,?,?,?,?, '', ?)",
@@ -1172,7 +1212,7 @@ def download_vendor(vendor: Vendor, db: DB, args, root: Path) -> dict:
     types = set(args.doc_types)
     out_dir = vendor.pdf_dir(root)
     stats = {"downloaded": 0, "duplicate": 0, "unchanged": 0, "failed": 0, "skipped_type": 0,
-             "translations_skipped": 0, "english_found_by_guess": 0, "foreign_kept_no_english": 0}
+             "translations_with_english": 0, "english_found_by_guess": 0, "foreign_no_english": 0}
     english_first = not args.keep_translations
     if english_first:
         tidy_translations(db, vendor, make_guesses=True)
@@ -1234,14 +1274,22 @@ def download_vendor(vendor: Vendor, db: DB, args, root: Path) -> dict:
         if STOP.is_set():
             break
         en = _english_for(db, english, row)
-        if en is not None:
-            db.execute("UPDATE pdf_links SET state='translation', english_url=? WHERE url=?", (en["url"], row["url"]))
-            stats["translations_skipped"] += 1
-            continue
         st = _download_one(row, f, db, args, root, vendor, out_dir)
+        if en is not None:
+            # English version is in the main folder; keep this copy too, filed under _translations/
+            if st == "downloaded":
+                cur = db.query("SELECT sha256 FROM pdf_links WHERE url=?", (row["url"],))
+                db.execute("UPDATE pdf_links SET state='translation', english_url=? WHERE url=?", (en["url"], row["url"]))
+                if cur and cur[0]["sha256"]:
+                    db.execute("UPDATE files SET is_translation=1, english_path=? WHERE sha256=?",
+                               (en["path"], cur[0]["sha256"]))
+                stats["translations_with_english"] += 1
+            else:
+                tally(st)
+            continue
         tally(st)
         if st == "downloaded":
-            stats["foreign_kept_no_english"] += 1
+            stats["foreign_no_english"] += 1
     if english_first:
         tidy_translations(db, vendor, make_guesses=False)
     log.info("[%s] download: %s", vendor.name, ", ".join(f"{k}={v}" for k, v in stats.items() if v))
@@ -1295,17 +1343,25 @@ def reorganize_files(db: DB, vendors: dict[str, Vendor], root: Path) -> int:
     by_name = {v.name: v for v in vendors.values()}
     moved = 0
     old_dirs: set[Path] = set()
-    for row in db.query("SELECT sha256, path, vendor, is_translation, rejected FROM files"):
+    rows = db.query("SELECT sha256, path, vendor, is_translation, rejected, bytes FROM files")
+    gone: list = []
+    for row in rows:
         v = by_name.get(row["vendor"])
         if v is None:
             continue
         old = root / row["path"]
         sub = "_rejected" if row["rejected"] else ("_translations" if row["is_translation"] else "")
         target_dir = v.pdf_dir(root) / sub
-        if old.parent == target_dir:
-            continue
         if not old.exists():
-            log.warning("reorganize: missing file %s", old)
+            found = _find_moved_file(root, old.name, row["bytes"], v)
+            if found is None:
+                gone.append(row)
+                continue
+            old = found        # moved by hand: pick it up from where it is now
+            rel = str(old.relative_to(root))
+            db.execute("UPDATE files SET path=? WHERE sha256=?", (rel, row["sha256"]))
+            db.execute("UPDATE pdf_links SET path=? WHERE sha256=?", (rel, row["sha256"]))
+        if old.parent == target_dir:
             continue
         target_dir.mkdir(parents=True, exist_ok=True)
         dest = target_dir / old.name
@@ -1326,7 +1382,33 @@ def reorganize_files(db: DB, vendors: dict[str, Vendor], root: Path) -> int:
     if moved:
         log.info("Moved %d PDF(s) into pdfs/<Category>/<Vendor>/ (translations -> _translations/, "
                  "junk -> _rejected/)", moved)
+    if gone:
+        if not (root / "pdfs").exists() or len(gone) > max(20, 0.3 * len(rows)):
+            log.warning("%d file(s) listed in the database are not on disk - is the drive connected? "
+                        "Nothing was changed.", len(gone))
+        else:
+            for row in gone:
+                db.execute("UPDATE pdf_links SET state='deleted' WHERE sha256=?", (row["sha256"],))
+                db.execute("DELETE FROM files WHERE sha256=?", (row["sha256"],))
+                db.execute("UPDATE files SET english_path=NULL WHERE english_path=?", (row["path"],))
+            names = ", ".join(Path(r["path"]).name for r in gone[:3]) + (" ..." if len(gone) > 3 else "")
+            log.info("%d file(s) were deleted outside the crawler (%s) - removed from the database and "
+                     "won't be downloaded again", len(gone), names)
     return moved
+
+
+def _find_moved_file(root: Path, name: str, size, vendor: Vendor):
+    """A file the user moved by hand: look in the vendor's folders first, then anywhere under pdfs/."""
+    for base in (vendor.pdf_dir(root), root / "pdfs"):
+        if not base.exists():
+            continue
+        for cand in base.rglob(name):
+            try:
+                if cand.is_file() and (not size or cand.stat().st_size == size):
+                    return cand
+            except OSError:
+                continue
+    return None
 
 
 # =============================================================================
@@ -1433,28 +1515,74 @@ def reject_unwanted(db: DB, doc_types: list[str]) -> int:
     return n
 
 
+def _is_english(lang: str) -> bool:
+    return lang == "en" or lang.endswith("+en")
+
+
+def _file_is_foreign(f) -> bool:
+    lang = f["language"] or ""
+    if name_lang(f["path"]) and lang != "en":
+        return True    # named '- CN' etc. and not purely English text (or no readable text)
+    return bool(lang) and not _is_english(lang)
+
+
 def pair_translations_by_text(db: DB) -> int:
-    """Non-English files (by text language) whose English twin is on disk under a matching name,
-    e.g. 'C1990_data.pdf' (Japanese) + 'C1990_data_english.pdf' -> mark the first as a translation."""
+    """Pair every non-English file with its English twin on disk (same vendor, matching name once the
+    language marker is removed): 'X - CN.pdf' + 'X.pdf', 'C1990_data.pdf' + 'C1990_data_english.pdf'."""
     n = 0
-    files = db.query("SELECT sha256, path, vendor, language, is_translation FROM files")
+    files = db.query("SELECT sha256, path, vendor, language, is_translation, english_path, rejected FROM files")
     english: dict = {}
     for f in files:
-        if f["language"] in ("en",) or (f["language"] or "").endswith("+en"):
+        if _is_english(f["language"] or "") and not name_lang(f["path"]):
             english.setdefault((f["vendor"], match_key(Path(f["path"]).stem)), f)
     for f in files:
-        lang = f["language"] or ""
-        if f["is_translation"] or not lang or lang == "en" or lang.endswith("+en"):
+        if f["english_path"] or not _file_is_foreign(f):
             continue
-        en = english.get((f["vendor"], match_key(Path(f["path"]).stem)))
+        en = english.get((f["vendor"], foreign_key(f["path"])))
         if en is not None and en["sha256"] != f["sha256"]:
             db.execute("UPDATE files SET is_translation=1, english_path=? WHERE sha256=?", (en["path"], f["sha256"]))
             db.execute("UPDATE pdf_links SET state='translation', english_url=(SELECT first_url FROM files WHERE "
                        "sha256=?) WHERE sha256=? AND state='downloaded'", (en["sha256"], f["sha256"]))
             n += 1
     if n:
-        log.info("Paired %d non-English file(s) with their English version by name (moved to _translations/)", n)
+        log.info("Paired %d non-English file(s) with their English version", n)
     return n
+
+
+def mark_non_english(db: DB) -> tuple[int, int]:
+    """Main folder = English only. Every non-English document goes to _translations/, whether or not an
+    English version was found (english_path tells which). Returns (non-English, with English version)."""
+    total = with_en = 0
+    for f in db.query("SELECT sha256, path, language, is_translation, english_path, rejected FROM files"):
+        foreign = _file_is_foreign(f)
+        if foreign and not f["is_translation"]:
+            db.execute("UPDATE files SET is_translation=1 WHERE sha256=?", (f["sha256"],))
+        elif not foreign and f["is_translation"] and _is_english(f["language"] or ""):
+            db.execute("UPDATE files SET is_translation=0, english_path=NULL WHERE sha256=?", (f["sha256"],))
+        if foreign and not f["rejected"]:
+            total += 1
+            with_en += 1 if f["english_path"] else 0
+    return total, with_en
+
+
+def queue_english_guesses(db: DB, vendors: dict[str, Vendor], only: set | None = None) -> list[Vendor]:
+    """For non-English files still without an English twin, queue guessed English URLs to try.
+    Returns the vendors that got new guesses."""
+    by_name = {v.name: v for v in vendors.values()}
+    hit: dict[str, Vendor] = {}
+    for f in db.query("SELECT f.vendor, f.first_url, l.doc_type FROM files f LEFT JOIN pdf_links l ON "
+                      "l.url = f.first_url WHERE f.is_translation=1 AND f.english_path IS NULL AND f.rejected IS NULL"):
+        url, v = f["first_url"], by_name.get(f["vendor"])
+        if only is not None and f["vendor"] not in only:
+            continue
+        if not url or v is None or db.query("SELECT 1 FROM pdf_links WHERE english_of=? LIMIT 1", (url,)):
+            continue
+        for g in english_url_guesses(url):
+            db.execute("INSERT OR IGNORE INTO pdf_links(url, vendor, found_on, anchor, doc_type, first_seen, lang, "
+                       "english_of) VALUES (?,?,?,?,?,?, '', ?)",
+                       (g, v.name, "english-guess", "", f["doc_type"] or "other", utcnow(), url))
+        hit[v.name] = v
+    return list(hit.values())
 
 
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")   # not allowed in Excel cells
@@ -1567,11 +1695,10 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
     if doc_types is not None and not keep_rejected:
         reject_unwanted(db, doc_types)
     pair_translations_by_text(db)
-    lone = db.query("SELECT COUNT(*) n FROM files WHERE COALESCE(is_translation,0)=0 AND rejected IS NULL AND "
-                    "language NOT IN ('', 'en') AND language NOT LIKE '%+en'")[0]["n"]
-    if lone:
-        log.info("%d non-English file(s) have no English version on disk (manifest column english_version = "
-                 "'NOT FOUND')", lone)
+    total, with_en = mark_non_english(db)
+    if total:
+        log.info("Non-English documents: %d (all in _translations/) - %d with an English version in the main "
+                 "folder, %d without (english_version = 'NOT FOUND')", total, with_en, total - with_en)
     return n
 
 
@@ -1611,8 +1738,8 @@ def print_status(db: DB, vendors: list[Vendor]):
     nf = db.query(f"SELECT COUNT(*) n FROM pdf_links WHERE state='downloaded' AND COALESCE(lang,'')<>'' "
                   f"AND vendor IN ({q})", names)[0]["n"]
     if tr or nf:
-        print(f"Translated copies: {tr} skipped/moved because the English version exists; "
-              f"{nf} kept because no English version was found")
+        print(f"Non-English copies: {tr} with an English version in the main folder; "
+              f"{nf} without an English version (all filed under _translations/)")
     skipped = [v.name for v in vendors if v.status == "skip"]
     if skipped:
         print(f"Skipped (status=skip in seeds): {', '.join(skipped)}")
@@ -1641,9 +1768,7 @@ def export_manifest(db: DB, vendors: dict[str, Vendor], root: Path) -> Path:
             if r["rejected"]:
                 eng = ""
             elif r["is_translation"]:
-                eng = r["english_path"] or ""
-            elif lang and lang != "en" and not lang.endswith("+en"):
-                eng = "NOT FOUND"
+                eng = r["english_path"] or "NOT FOUND"
             else:
                 eng = ""
             w.writerow([r["vendor"], cats.get(r["vendor"], ""), folders.get(r["vendor"], ""), r["path"], r["bytes"],
@@ -1661,11 +1786,13 @@ DOC_TYPE_LABEL = {"tds": "Technical data sheet", "brochure": "Brochure / selecto
 
 
 def export_catalog_xlsx(db: DB, vendors: dict[str, Vendor], root: Path) -> Path | None:
-    """tds_catalog.xlsx: Category | Vendor | Document (clickable) | Description | ... one row per file."""
+    """tds_catalog.xlsx: a Summary sheet, one sheet per material category (Vendor | Document (clickable) |
+    Description | Type | Test methods | Pages | Language | Source URL), then Translations and Rejected."""
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill
         from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.hyperlink import Hyperlink
     except ImportError:
         log.warning("openpyxl missing - catalog not written")
         return None
@@ -1678,52 +1805,108 @@ def export_catalog_xlsx(db: DB, vendors: dict[str, Vendor], root: Path) -> Path 
         folder = v.category_folder if v else "0_Uncategorized"
         return folder, re.sub(r"^\d+_", "", folder).replace("_", " ")
 
-    def describe(r) -> str:
-        label = DOC_TYPE_LABEL.get(r["text_doc_type"] or r["link_type"] or "other", "Technical document")
-        summ = r["summary"] or re.sub(r"[_\-]+", " ", Path(r["path"]).stem)
-        return f"{label}: {summ}"
+    def sheet_name(folder: str) -> str:
+        name = folder.replace("_", " ")                       # '4 Polymer Films'
+        return re.sub(r"[\\/?*\[\]:]", "-", name)[:31]
 
-    sheets = {"Catalog": [], "Translations": [], "Rejected": []}
+    def type_label(r) -> str:
+        return DOC_TYPE_LABEL.get(r["text_doc_type"] or r["link_type"] or "other", "Technical document")
+
+    def describe(r) -> str:
+        summ = r["summary"] or re.sub(r"[_\-]+", " ", Path(r["path"]).stem)
+        return f"{type_label(r)}: {summ}"
+
+    kept: dict[str, list] = {}
+    translations, rejected = [], []
     for r in rows:
-        key = "Rejected" if r["rejected"] else ("Translations" if r["is_translation"] else "Catalog")
-        sheets[key].append(r)
+        if r["rejected"]:
+            rejected.append(r)
+        elif r["is_translation"]:
+            translations.append(r)
+        else:
+            kept.setdefault(category(r["vendor"])[0], []).append(r)
+
     wb = Workbook()
     hdr_fill = PatternFill("solid", fgColor="1F3864")
-    cols = [("Category", 20), ("Vendor", 30), ("Document", 46), ("Description", 70), ("Type", 22),
-            ("Test methods", 34), ("Pages", 7), ("Language", 9), ("Source URL", 50)]
-    for idx, (sheet, items) in enumerate(sheets.items()):
-        ws = wb.active if idx == 0 else wb.create_sheet()
-        ws.title = sheet
-        extra = {"Translations": ("English version", 46), "Rejected": ("Rejected as", 16)}.get(sheet)
-        header = cols + ([extra] if extra else [])
-        for c, (name, width) in enumerate(header, 1):
+    link_font = Font(color="0563C1", underline="single")
+
+    def header(ws, cols):
+        for c, (name, width) in enumerate(cols, 1):
             cell = ws.cell(1, c, name)
             cell.font = Font(bold=True, color="FFFFFF")
             cell.fill = hdr_fill
             cell.alignment = Alignment(vertical="center")
             ws.column_dimensions[get_column_letter(c)].width = width
+        ws.freeze_panes = "A2"
+
+    def put(ws, i, c, v, wrap=False):
+        if isinstance(v, str):
+            v = CONTROL_CHARS_RE.sub(" ", v)
+        cell = ws.cell(i, c, v)
+        cell.alignment = Alignment(vertical="top", wrap_text=wrap)
+        return cell
+
+    doc_cols = [("Vendor", 30), ("Document", 46), ("Description", 70), ("Type", 22),
+                ("Test methods", 34), ("Pages", 7), ("Language", 9), ("Source URL", 50)]
+
+    def write_docs(ws, items, lead_category: bool, extra=None):
+        cols = ([("Category", 20)] if lead_category else []) + doc_cols + ([extra[0]] if extra else [])
+        header(ws, cols)
+        off = 1 if lead_category else 0
         items.sort(key=lambda r: (category(r["vendor"])[0], r["vendor"].lower(), Path(r["path"]).name.lower()))
         for i, r in enumerate(items, 2):
-            _, cat = category(r["vendor"])
-            vals = [cat, r["vendor"], Path(r["path"]).name, describe(r),
-                    DOC_TYPE_LABEL.get(r["text_doc_type"] or r["link_type"] or "other", ""),
-                    r["test_methods"] or "", r["pages"], r["language"] or "", r["first_url"]]
-            if sheet == "Translations":
-                vals.append(Path(r["english_path"]).name if r["english_path"] else "")
-            elif sheet == "Rejected":
-                vals.append(r["rejected"] or "")
+            vals = ([category(r["vendor"])[1]] if lead_category else []) + [
+                r["vendor"], Path(r["path"]).name, describe(r), type_label(r), r["test_methods"] or "",
+                r["pages"], r["language"] or "", r["first_url"]]
+            if extra:
+                vals.append(extra[1](r))
             for c, v in enumerate(vals, 1):
-                if isinstance(v, str):
-                    v = CONTROL_CHARS_RE.sub(" ", v)
-                cell = ws.cell(i, c, v)
-                cell.alignment = Alignment(vertical="top", wrap_text=(c == 4))
-            doc = ws.cell(i, 3)
-            doc.hyperlink = r["path"]               # relative to the workbook (saved in the corpus root)
-            doc.font = Font(color="0563C1", underline="single")
+                put(ws, i, c, v, wrap=(c == 3 + off))
+            doc = ws.cell(i, 2 + off)
+            doc.hyperlink = r["path"]                 # relative to the workbook (saved in the corpus root)
+            doc.font = link_font
             if r["first_url"]:
-                ws.cell(i, 9).hyperlink = r["first_url"]
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = f"A1:{get_column_letter(len(header))}{max(1, len(items) + 1)}"
+                ws.cell(i, 8 + off).hyperlink = r["first_url"]
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{max(1, len(items) + 1)}"
+
+    # Summary
+    ws = wb.active
+    ws.title = "Summary"
+    header(ws, [("Category", 30), ("Vendors", 9), ("Documents", 11), ("Translations", 13), ("Rejected", 10)])
+    folders = sorted({v.category_folder for v in vendors.values() if v.status != "skip"} | set(kept))
+    tr_by = {}
+    rj_by = {}
+    for r in translations:
+        tr_by[category(r["vendor"])[0]] = tr_by.get(category(r["vendor"])[0], 0) + 1
+    for r in rejected:
+        rj_by[category(r["vendor"])[0]] = rj_by.get(category(r["vendor"])[0], 0) + 1
+    i = 1
+    for folder in folders:
+        items = kept.get(folder, [])
+        i += 1
+        put(ws, i, 1, re.sub(r"^\d+_", "", folder).replace("_", " "))
+        put(ws, i, 2, len({r["vendor"] for r in items}))
+        put(ws, i, 3, len(items))
+        put(ws, i, 4, tr_by.get(folder, 0))
+        put(ws, i, 5, rj_by.get(folder, 0))
+        if items:
+            ws.cell(i, 1).hyperlink = Hyperlink(ref=f"A{i}", location=f"'{sheet_name(folder)}'!A1")
+            ws.cell(i, 1).font = link_font
+    i += 1
+    put(ws, i, 1, "Total").font = Font(bold=True)
+    for c, n in ((3, sum(len(v) for v in kept.values())), (4, len(translations)), (5, len(rejected))):
+        put(ws, i, c, n).font = Font(bold=True)
+
+    # One sheet per category
+    for folder in sorted(kept):
+        write_docs(wb.create_sheet(sheet_name(folder)), kept[folder], lead_category=False)
+    # Translations / Rejected (span all categories)
+    write_docs(wb.create_sheet("Translations"), translations, lead_category=True,
+               extra=(("English version", 46),
+                      lambda r: Path(r["english_path"]).name if r["english_path"] else "NOT FOUND"))
+    write_docs(wb.create_sheet("Rejected"), rejected, lead_category=True,
+               extra=(("Rejected as", 16), lambda r: r["rejected"] or ""))
+
     out = root / "tds_catalog.xlsx"
     try:
         wb.save(out)
@@ -1731,8 +1914,8 @@ def export_catalog_xlsx(db: DB, vendors: dict[str, Vendor], root: Path) -> Path 
         out = root / f"tds_catalog_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
         wb.save(out)
         log.warning("tds_catalog.xlsx is open in Excel - wrote %s instead", out.name)
-    log.info("Catalog written: %s (%d documents, %d translations, %d rejected)", out,
-             len(sheets["Catalog"]), len(sheets["Translations"]), len(sheets["Rejected"]))
+    log.info("Catalog written: %s (%d documents in %d category sheets, %d translations, %d rejected)", out,
+             sum(len(v) for v in kept.values()), len(kept), len(translations), len(rejected))
     return out
 
 
@@ -1786,7 +1969,8 @@ def parse_args(argv=None):
     ap.add_argument("--keep-rejected", action="store_true",
                     help="don't move files whose text shows an unwanted type (corporate, SDS...) to _rejected/")
     ap.add_argument("--keep-translations", action="store_true",
-                    help="download translated copies (e.g. '- CN') even when the English version exists")
+                    help="turn off language sorting: keep non-English documents in the main folder and don't hunt for "
+                         "English versions")
     ap.add_argument("--js", action="store_true", help="render render_js=1 vendors with Playwright")
     ap.add_argument("--search-seed", action="store_true",
                     help="seed PDF URLs from SerpAPI or Google CSE (env SERPAPI_KEY or GOOGLE_CSE_KEY+GOOGLE_CSE_CX)")
@@ -1861,6 +2045,8 @@ def main(argv=None):
         if args.reorganize and not args.keep_translations:
             for v in vendors_all.values():
                 tidy_translations(db, v, make_guesses=False)
+            pair_translations_by_text(db)
+            mark_non_english(db)
         if args.reorganize or args.download:
             reorganize_files(db, vendors_all, root)
         if args.discover:
@@ -1879,10 +2065,19 @@ def main(argv=None):
             apply_pdf_filters(db, vendors_all)   # discovery may have handed shared-site PDFs to the distributor
             dl_vendors = [v for v in chosen if v.status in allowed_status]
             run_parallel(lambda v: download_vendor(v, db, args, root), dl_vendors, args.workers)
-            reorganize_files(db, vendors_all, root)   # files into place; translated copies -> _translations/
+            if not args.keep_translations:
+                pair_translations_by_text(db)
+                mark_non_english(db)
+            reorganize_files(db, vendors_all, root)   # files into place; non-English copies -> _translations/
         if args.classify and not STOP.is_set():
             backfill_link_lang(db)
             classify_files(db, root, redo=args.reclassify, doc_types=args.doc_types, keep_rejected=args.keep_rejected)
+            if args.download and not args.keep_translations and not STOP.is_set():
+                more = queue_english_guesses(db, vendors_all, only={v.name for v in chosen})
+                if more:
+                    log.info("Looking for English versions of non-English documents (%d vendor(s))", len(more))
+                    run_parallel(lambda v: download_vendor(v, db, args, root), more, args.workers)
+                    classify_files(db, root, redo=False, doc_types=args.doc_types, keep_rejected=args.keep_rejected)
             reorganize_files(db, vendors_all, root)
         if args.export:
             export_manifest(db, vendors_all, root)

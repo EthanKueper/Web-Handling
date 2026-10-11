@@ -44,8 +44,8 @@ D:\tds_corpus\
   pdfs\<Category>\<Vendor>\_rejected\       downloaded files whose text shows junk: reports, IR, press releases... (delete when happy)
   tds_crawler.db            SQLite (WAL): pages, pdf_links, files, vendors
   tds_manifest.csv          one row per file: vendor, categories, title, doc type, test methods, source URL...
-  tds_catalog.xlsx          Excel catalogue: Category | Vendor | Document (click to open) | Description | Type |
-                            Test methods | Pages | Language | Source URL  (sheets: Catalog, Translations, Rejected)
+  tds_catalog.xlsx          Excel catalogue: Summary + one sheet per category (Vendor | Document (click to open) |
+                            Description | Type | Test methods | Pages | Language | Source URL) + Translations + Rejected
   logs\tds_crawler_YYYYMMDD.log
 ```
 
@@ -53,19 +53,30 @@ Category folders come from the workbook sheet names: `1_Foil_Materials`, `2_Nonw
 
 ## Excel catalogue
 
-`--export` (and `--all`) also writes `tds_catalog.xlsx` in the corpus root. It has one row per PDF, with the material category, supplier and file name; the file name is a link, so clicking it opens the PDF. Each row also has a one-line description built from the document's opening text (for example *Technical data sheet: DuPont Pyralux AG - All-Polyimide Double-Sided Copper-Clad Laminate*), plus the type, test methods cited, page count, language and source URL. Kept documents are on the **Catalog** sheet. Translated copies are on **Translations**, with their English twin named, and junk is on **Rejected**, with the reason. Keep the workbook in the corpus root so the links work. If it's open in Excel during a run, a time-stamped copy is written instead.
+`--export` (and `--all`) also writes `tds_catalog.xlsx` in the corpus root. It has these sheets:
+
+- **Summary:** one row per material category, with counts of suppliers, documents, translations and rejected files. Click a category name to jump to its sheet.
+- **One sheet per category** (`1 Foil Materials`, `2 Nonwoven Fabrics`, `4 Polymer Films`, ... `8 Multi Category`): one row per kept PDF, with Vendor, Document, Description, Type, Test methods, Pages, Language and Source URL. The file name is a link, so clicking it opens the PDF. The description is built from the document's opening text, for example *Technical data sheet: DuPont Pyralux AG - All-Polyimide Double-Sided Copper-Clad Laminate*.
+- **Translations:** every non-English copy, with its category and the English version's file name, or `NOT FOUND`.
+- **Rejected:** junk files, with their category and the reason.
+
+Keep the workbook in the corpus root so the links work. If it's open in Excel during a run, a time-stamped copy is written instead.
 
 ## Foreign-language documents (English first)
 
-Many vendors post translated copies of the same sheet, such as `RO1200 Data Sheet - CN.pdf`. The crawler recognises these from a language code at the end of the filename (`- CN`, `_JP`, `(KR)`, `-DE`...), a language word (`_Chinese`), or a locale folder in the URL (`/zh-cn/`, `/ja/`), and always tries to get the English version first:
+The main supplier folder holds English documents only. For every non-English document, the crawler tries to find the English version first:
 
-1. If the English version is among the links found, only the English one is downloaded.
-2. If not, it tries likely English URLs: the same name without the code, or with `-EN` / `_EN`, or the `/en/` folder instead of `/ja/`.
-3. If no English version exists, the foreign copy is downloaded anyway so no data is lost, and the manifest flags it.
+1. **During the crawl.** A translated copy is recognised by a language code at the end of its filename (`- CN`, `_JP`, `(KR)`, `-DE`...), a language word (`_Chinese`), or a locale folder in its URL (`/zh-cn/`, `/ja/`). The English version is downloaded first.
+2. **Guessed URLs.** If the English version wasn't linked, likely English URLs are tried: the name without the code, `-EN`, `_EN`, `_english`, or the `/en/` folder instead of `/ja/`.
+3. **After `--classify`.** Documents found to be non-English from their text, even without a code in the name (for example `C1990_data.pdf` in Japanese), get the same URL guesses. Every non-English file is then matched against English files on disk by name.
 
-Translated copies already on disk whose English version later turns up are moved to `_translations\`, not deleted. Add `--keep-translations` to download every language version.
+Where the files go:
+- **English version found:** the English file goes in the main folder and the non-English copy in `_translations\`.
+- **No English version found:** the non-English copy still goes in `_translations\`, and the crawler moves on.
 
-After `--classify`, the manifest's `language` column is read from the PDF text: `en`, `zh`, `ja`, `ko`, `de`..., or `ja+en` for bilingual sheets. `english_version` gives the path of the English file for a translated copy, or `NOT FOUND` when a non-English sheet has no English counterpart. Filter on `NOT FOUND` to see which ones need a manual search or a request to the vendor.
+A file named like a translation (`- CN`) counts as non-English unless its text is purely English. Bilingual sheets, such as a Japanese sheet with full English text, stay in the main folder.
+
+In `tds_manifest.csv` and on the catalogue's **Translations** sheet, `english_version` names the English file, or says `NOT FOUND`. The manifest's `language` column is read from the PDF text: `en`, `zh`, `ja`, `ko`, `de`..., or `ja+en` for bilingual sheets. `--keep-translations` turns language sorting off.
 
 ## Junk filtering (corporate, IR, press)
 
@@ -92,6 +103,8 @@ When a supplier's sheets are hosted on a distributor's site (Camden Copper and J
 **Classification.** After download, pypdf reads the text of pages 1–2 and records the document type from the text, the title, the page count, and the test methods cited: ASTM D882, ISO 527, TAPPI T410, NWSP 100.1, IPC-TM-650 2.4.8, DIN, JIS. The `method_families` column lets you separate film, paper and nonwoven data before comparing values. A file whose name says "data sheet", or whose first pages cite two or more test methods, is classed as a data sheet unless it is a safety data sheet.
 
 **Resumable.** Ctrl-C saves state, and running the same command again continues from there. A vendor that hits `--max-pages` keeps its queue, so another `--discover` run goes deeper.
+
+**Files you move or delete yourself.** If you move a PDF by hand, the crawler finds it again under `pdfs\` and records the new location. If you delete one, it's dropped from the database once and not downloaded again. If a large share of files seem missing, for example because the drive isn't connected, nothing is changed.
 
 **Revisions.** `--download --refresh` re-checks each downloaded PDF with ETag and If-Modified-Since. A changed sheet is saved as a new file and the old one is kept.
 
