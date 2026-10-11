@@ -1457,6 +1457,31 @@ def pair_translations_by_text(db: DB) -> int:
     return n
 
 
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")   # not allowed in Excel cells
+
+
+def unshift_text(text: str) -> str:
+    """Some PDFs use fonts whose character codes are shifted by a constant (often 29 or 31), so the
+    extracted text reads '.BSLFU0WFSWJFX' instead of 'Market Overview'. If shifting it back gives far
+    more English words, use the shifted-back text."""
+    if not text or re.search(r"\b(the|and|of|for|with)\b", text[:3000], re.I):
+        return text
+    sample = re.sub(r"\s", "", text[:4000])
+    if not sample or sum(1 for c in sample if ord(c) < 128) < 0.95 * len(sample):
+        return text  # CJK / accented text - shifted-font garbage is plain ASCII
+
+    def hits(t: str) -> int:
+        return sum(1 for w in re.findall(r"[a-z]+", t[:4000].lower()) if w in ENGLISH_STOPWORDS)
+
+    base, best, best_txt = hits(text), 0, text
+    for k in (29, 31, 3, 1):
+        cand = "".join(chr(ord(c) + k) if 33 <= ord(c) <= 126 - k else c for c in text)
+        h = hits(cand)
+        if h > best:
+            best, best_txt = h, cand
+    return best_txt if best >= 3 and best > 2 * base else text
+
+
 SUMMARY_SKIP_RE = re.compile(
     r"(copyright|©|all rights reserved|www\.|https?://|@|\btel\b|\bfax\b|phone|page \d+ of \d+|^\d+ of \d+$|"
     r"^\d[\d\s.,/-]*$|street|road|avenue|\bsuite\b|\bzip\b|confidential|the information contained|"
@@ -1487,7 +1512,7 @@ def make_summary(text: str, filename: str) -> str:
     out = " - ".join(picked)
     if not out:
         out = re.sub(r"[_\-]+", " ", Path(filename).stem).strip()
-    return out[:180]
+    return CONTROL_CHARS_RE.sub(" ", out)[:180]
 
 
 def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_rejected: bool = False) -> int:
@@ -1517,6 +1542,7 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
             pages = len(rd.pages)
             for pg in rd.pages[:2]:
                 text += (pg.extract_text() or "") + "\n"
+            text = unshift_text(CONTROL_CHARS_RE.sub(" ", text))
             meta_title = (rd.metadata.title if rd.metadata else None) or ""
             first_line = next((l.strip() for l in text.splitlines() if len(l.strip()) > 3), "")
             title = (meta_title if len(meta_title.strip()) > 3 else first_line)[:200]
@@ -1687,6 +1713,8 @@ def export_catalog_xlsx(db: DB, vendors: dict[str, Vendor], root: Path) -> Path 
             elif sheet == "Rejected":
                 vals.append(r["rejected"] or "")
             for c, v in enumerate(vals, 1):
+                if isinstance(v, str):
+                    v = CONTROL_CHARS_RE.sub(" ", v)
                 cell = ws.cell(i, c, v)
                 cell.alignment = Alignment(vertical="top", wrap_text=(c == 4))
             doc = ws.cell(i, 3)
