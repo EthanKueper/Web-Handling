@@ -174,9 +174,10 @@ GOOD_STATES = ("downloaded", "duplicate", "unchanged")
 CORPORATE_TEXT_RE = re.compile(
     r"(integrated report|annual report|sustainability report|medium\s*-?\s*term\s+management|"
     r"long\s*-?\s*term\s+vision|management plan|balance sheet|financial results|financial statements|securities report|shareholders|"
-    r"corporate governance report|esg data|"
+    r"corporate governance report|esg data|access map|booth map|floor plan|site map|notice of|"
     r"貸借対照表|損益計算書|中期経営計画|長期ビジョン|統合報告|決算|株主|有価証券報告書|各\s*位|ステークホルダー|"
-    r"お問い合わせ先|ニュースリリース|プレスリリース|会社概要|"
+    r"お問い合わせ先|ニュースリリース|プレスリリース|会社概要|アクセスマップ|ブースマップ|計算書類|附属明細書|"
+    r"委託生産|お知らせ|経営計画|事業報告|"
     r"资产负债表|年度报告|可持续发展报告|中期经营计划|重大课题|公司治理|"
     r"재무상태표|지속가능경영보고서|사업보고서)", re.I)
 
@@ -1332,6 +1333,7 @@ def reorganize_files(db: DB, vendors: dict[str, Vendor], root: Path) -> int:
 # CLASSIFY (pypdf)
 # =============================================================================
 def extract_methods(text: str) -> tuple[list[str], list[str]]:
+    text = unicodedata.normalize("NFKC", text or "")
     found: dict = {}
     fams: dict = {}
     for fam, rx in TEST_METHOD_PATTERNS:
@@ -1350,10 +1352,13 @@ def extract_methods(text: str) -> tuple[list[str], list[str]]:
     return list(found)[:40], list(fams)
 
 
-def classify_text_doc_type(text: str, link_type: str = "", n_methods: int = 0) -> str:
+def classify_text_doc_type(text: str, link_type: str = "", n_methods: int = 0, hints: str = "") -> str:
     """Classify from extracted PDF text: header first, body as fallback. A filename that already says
     'data sheet', or a page citing 2+ test methods, counts as a data sheet unless it is an SDS."""
-    if link_type == "corporate":
+    # NFKC: full-width letters, compatibility ideographs and decomposed kana (フ+゛ -> ブ) match the patterns
+    text = unicodedata.normalize("NFKC", text or "")
+    hints = unicodedata.normalize("NFKC", hints or "")
+    if link_type == "corporate" or (hints and CORPORATE_TEXT_RE.search(hints)):
         return "corporate"
     if not text.strip():
         return "unreadable"
@@ -1361,10 +1366,12 @@ def classify_text_doc_type(text: str, link_type: str = "", n_methods: int = 0) -
     head = text[:800]
     if rx["sds"].search(head) and not rx["tds"].search(head[:200]):
         return "sds"
-    if CORPORATE_TEXT_RE.search(head):
+    if CORPORATE_TEXT_RE.search(text[:1500]):
         return "corporate"
     if link_type == "tds" or n_methods >= 2:
         return "tds"
+    if CORPORATE_TEXT_RE.search(text[:5000]):
+        return "corporate"
     if rx["corporate"].search(head):
         return "corporate"
     for t in ("tds", "brochure"):
@@ -1378,6 +1385,37 @@ def classify_text_doc_type(text: str, link_type: str = "", n_methods: int = 0) -
     if TEXT_CERT_RE.search(text[:6000]):
         return "certificate"
     return "other"
+
+
+def name_pattern(path: str) -> str:
+    """'201903_nmm.pdf' -> '#_nmm' : digits collapsed, our _xxxxxxxx collision suffix removed."""
+    stem = COLLISION_SUFFIX_RE.sub("", Path(path).stem.lower())
+    return re.sub(r"\d+", "#", stem)
+
+
+def infer_from_siblings(db: DB) -> int:
+    """Files whose text can't be judged (garbled / image-only / 'other') inherit 'corporate' when most
+    of their same-vendor siblings with the same name pattern (e.g. ####_nmm) are corporate."""
+    groups: dict = {}
+    for r in db.query("SELECT sha256, path, vendor, text_doc_type FROM files WHERE text_doc_type IS NOT NULL"):
+        pat = name_pattern(r["path"])
+        if not re.search(r"[a-z]", pat):
+            continue  # pure dates/numbers are too generic to group on
+        groups.setdefault((r["vendor"], pat), []).append(r)
+    n = 0
+    for members in groups.values():
+        if len(members) < 3:
+            continue
+        judged = [m for m in members if m["text_doc_type"] not in ("other", "unreadable")]
+        corp = [m for m in judged if m["text_doc_type"] == "corporate"]
+        if len(corp) >= 2 and len(corp) >= 0.75 * len(judged):
+            for m in members:
+                if m["text_doc_type"] in ("other", "unreadable"):
+                    db.execute("UPDATE files SET text_doc_type='corporate' WHERE sha256=?", (m["sha256"],))
+                    n += 1
+    if n:
+        log.info("Marked %d unreadable/unclear file(s) corporate because their same-named siblings are", n)
+    return n
 
 
 def reject_unwanted(db: DB, doc_types: list[str]) -> int:
@@ -1459,6 +1497,11 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
         log.warning("pypdf not installed - skipping classification (pip install pypdf)")
         return 0
     logging.getLogger("pypdf").setLevel(logging.ERROR)
+    try:
+        import pypdf
+        log.info("Text extraction: pypdf %s", getattr(pypdf, "__version__", "?"))
+    except Exception:
+        pass
     rows = db.query("SELECT f.sha256, f.path, l.doc_type AS link_type FROM files f "
                     "LEFT JOIN pdf_links l ON l.url = f.first_url" +
                     ("" if redo else " WHERE f.classified_at IS NULL OR f.language IS NULL OR f.summary IS NULL"))
@@ -1468,6 +1511,7 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
             break
         p = root / row["path"]
         title, pages, text = "", None, ""
+        rd = None
         try:
             rd = PdfReader(str(p))
             pages = len(rd.pages)
@@ -1479,7 +1523,13 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
         except Exception as e:
             log.debug("classify %s: %s", p, e)
         methods, fams = extract_methods(text)
-        dtype = classify_text_doc_type(text, row["link_type"] or "", len(methods))
+        meta_t = ""
+        try:
+            meta_t = (rd.metadata.title or "") if rd.metadata else ""
+        except Exception:
+            pass
+        dtype = classify_text_doc_type(text, row["link_type"] or "", len(methods),
+                                       hints=f"{meta_t} {Path(row['path']).stem}")
         lang = detect_language(text)
         summary = make_summary(text, row["path"])
         db.execute("UPDATE files SET pages=?, title=?, text_doc_type=?, test_methods=?, method_families=?, "
@@ -1487,6 +1537,7 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
                    (pages, title, dtype, "; ".join(methods), "; ".join(fams), lang, summary, utcnow(), row["sha256"]))
         n += 1
     log.info("Classified %d file(s)", n)
+    infer_from_siblings(db)
     if doc_types is not None and not keep_rejected:
         reject_unwanted(db, doc_types)
     pair_translations_by_text(db)
