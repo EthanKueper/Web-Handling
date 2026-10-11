@@ -170,7 +170,7 @@ from openpyxl.utils import column_index_from_string
 # Then leave this as None.
 # ------------------------------------------------------------
 
-USPTO_API_KEY = "qeugagzhssbywdnzucrapiliukuezi"
+USPTO_API_KEY = "YOUR_API_KEY_HERE"
 # Example:
 # USPTO_API_KEY = "YOUR_API_KEY_HERE"
 
