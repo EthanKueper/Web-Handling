@@ -44,10 +44,16 @@ D:\tds_corpus\
   pdfs\<Category>\<Vendor>\_rejected\       downloaded files whose text shows junk: reports, IR, press releases... (delete when happy)
   tds_crawler.db            SQLite (WAL): pages, pdf_links, files, vendors
   tds_manifest.csv          one row per file: vendor, categories, title, doc type, test methods, source URL...
+  tds_catalog.xlsx          Excel catalogue: Category | Vendor | Document (click to open) | Description | Type |
+                            Test methods | Pages | Language | Source URL  (sheets: Catalog, Translations, Rejected)
   logs\tds_crawler_YYYYMMDD.log
 ```
 
 Category folders come from the workbook sheet names: `1_Foil_Materials`, `2_Nonwoven_Fabrics`, `3_Specialty_Paper`, `4_Polymer_Films`, `5_Web_Converting`, `6_Equipment_Machinery`, `7_Process_Technology`. A company listed on more than one sheet (Dow, ExxonMobil, Oerlikon, Brückner) goes in the first sheet's folder, and `tds_manifest.csv` lists all of its categories. To choose a different folder for a company, fill in its `folder` column in `vendor_seeds.csv`. Files downloaded in an older layout are moved automatically on the next `--download`, or by running `--reorganize` on its own.
+
+## Excel catalogue
+
+`--export` (and `--all`) also writes `tds_catalog.xlsx` in the corpus root. It has one row per PDF, with the material category, supplier and file name; the file name is a link, so clicking it opens the PDF. Each row also has a one-line description built from the document's opening text (for example *Technical data sheet: DuPont Pyralux AG - All-Polyimide Double-Sided Copper-Clad Laminate*), plus the type, test methods cited, page count, language and source URL. Kept documents are on the **Catalog** sheet. Translated copies are on **Translations**, with their English twin named, and junk is on **Rejected**, with the reason. Keep the workbook in the corpus root so the links work. If it's open in Excel during a run, a time-stamped copy is written instead.
 
 ## Foreign-language documents (English first)
 

@@ -571,8 +571,11 @@ class DB:
                 if name not in have:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
         c.execute("CREATE INDEX IF NOT EXISTS ix_pdf_english_of ON pdf_links(english_of)")
-        if "rejected" not in {r[1] for r in c.execute("PRAGMA table_info(files)")}:
+        have_files = {r[1] for r in c.execute("PRAGMA table_info(files)")}
+        if "rejected" not in have_files:
             c.execute("ALTER TABLE files ADD COLUMN rejected TEXT")
+        if "summary" not in have_files:
+            c.execute("ALTER TABLE files ADD COLUMN summary TEXT")
         # pages used to be keyed by url alone, which mixed up vendors sharing a site
         pk = [r[1] for r in c.execute("PRAGMA table_info(pages)") if r[5]]
         if pk == ["url"]:
@@ -1416,6 +1419,39 @@ def pair_translations_by_text(db: DB) -> int:
     return n
 
 
+SUMMARY_SKIP_RE = re.compile(
+    r"(copyright|©|all rights reserved|www\.|https?://|@|\btel\b|\bfax\b|phone|page \d+ of \d+|^\d+ of \d+$|"
+    r"^\d[\d\s.,/-]*$|street|road|avenue|\bsuite\b|\bzip\b|confidential|the information contained|"
+    r"disclaimer|effective date|^ver\.?\s*\d|^rev\.?\s*\d|^version|^updated|^issued|^date\b|"
+    r"^[※*†]|data in this|representative value|not guaranteed|typical values?\b.*\bnot\b|for reference only|"
+    r"subject to change|without notice)", re.I)
+
+
+def make_summary(text: str, filename: str) -> str:
+    """One-line description from the first meaningful lines of the PDF (or the filename)."""
+    picked: list[str] = []
+    for line in text.splitlines():
+        ln = re.sub(r"\s+", " ", line).strip(" •·●○■□◆▪-–|*")
+        if len(ln) < 12 or SUMMARY_SKIP_RE.search(ln):
+            continue
+        if sum(ch.isalpha() for ch in ln) < len(ln) * 0.5 and not re.search(r"[\u3040-\u9fff\uac00-\ud7af]", ln):
+            continue  # mostly numbers / table cells
+        if picked and ln.lower() in picked[-1].lower():
+            continue
+        if picked and ln[:1].islower() and not picked[-1].endswith((".", ":", ";")):
+            picked[-1] = f"{picked[-1]} {ln}"   # same sentence wrapped onto the next line
+        else:
+            if len(picked) == 2:
+                break
+            picked.append(ln)
+        if len(" - ".join(picked)) > 110:
+            break
+    out = " - ".join(picked)
+    if not out:
+        out = re.sub(r"[_\-]+", " ", Path(filename).stem).strip()
+    return out[:180]
+
+
 def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_rejected: bool = False) -> int:
     try:
         from pypdf import PdfReader
@@ -1425,7 +1461,7 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
     logging.getLogger("pypdf").setLevel(logging.ERROR)
     rows = db.query("SELECT f.sha256, f.path, l.doc_type AS link_type FROM files f "
                     "LEFT JOIN pdf_links l ON l.url = f.first_url" +
-                    ("" if redo else " WHERE f.classified_at IS NULL OR f.language IS NULL"))
+                    ("" if redo else " WHERE f.classified_at IS NULL OR f.language IS NULL OR f.summary IS NULL"))
     n = 0
     for row in rows:
         if STOP.is_set():
@@ -1445,9 +1481,10 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
         methods, fams = extract_methods(text)
         dtype = classify_text_doc_type(text, row["link_type"] or "", len(methods))
         lang = detect_language(text)
+        summary = make_summary(text, row["path"])
         db.execute("UPDATE files SET pages=?, title=?, text_doc_type=?, test_methods=?, method_families=?, "
-                   "language=?, classified_at=? WHERE sha256=?",
-                   (pages, title, dtype, "; ".join(methods), "; ".join(fams), lang, utcnow(), row["sha256"]))
+                   "language=?, summary=?, classified_at=? WHERE sha256=?",
+                   (pages, title, dtype, "; ".join(methods), "; ".join(fams), lang, summary, utcnow(), row["sha256"]))
         n += 1
     log.info("Classified %d file(s)", n)
     if doc_types is not None and not keep_rejected:
@@ -1541,6 +1578,85 @@ def export_manifest(db: DB, vendors: dict[str, Vendor], root: Path) -> Path:
     return out
 
 
+DOC_TYPE_LABEL = {"tds": "Technical data sheet", "brochure": "Brochure / selector guide", "sds": "Safety data sheet",
+                  "certificate": "Certificate / statement", "corporate": "Corporate document",
+                  "other": "Technical document", "unreadable": "Scanned / image-only PDF"}
+
+
+def export_catalog_xlsx(db: DB, vendors: dict[str, Vendor], root: Path) -> Path | None:
+    """tds_catalog.xlsx: Category | Vendor | Document (clickable) | Description | ... one row per file."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        log.warning("openpyxl missing - catalog not written")
+        return None
+    by_name = {v.name: v for v in vendors.values()}
+    rows = db.query("""SELECT f.*, l.doc_type AS link_type FROM files f
+                       LEFT JOIN pdf_links l ON l.url = f.first_url""")
+
+    def category(vname: str) -> tuple[str, str]:
+        v = by_name.get(vname)
+        folder = v.category_folder if v else "0_Uncategorized"
+        return folder, re.sub(r"^\d+_", "", folder).replace("_", " ")
+
+    def describe(r) -> str:
+        label = DOC_TYPE_LABEL.get(r["text_doc_type"] or r["link_type"] or "other", "Technical document")
+        summ = r["summary"] or re.sub(r"[_\-]+", " ", Path(r["path"]).stem)
+        return f"{label}: {summ}"
+
+    sheets = {"Catalog": [], "Translations": [], "Rejected": []}
+    for r in rows:
+        key = "Rejected" if r["rejected"] else ("Translations" if r["is_translation"] else "Catalog")
+        sheets[key].append(r)
+    wb = Workbook()
+    hdr_fill = PatternFill("solid", fgColor="1F3864")
+    cols = [("Category", 20), ("Vendor", 30), ("Document", 46), ("Description", 70), ("Type", 22),
+            ("Test methods", 34), ("Pages", 7), ("Language", 9), ("Source URL", 50)]
+    for idx, (sheet, items) in enumerate(sheets.items()):
+        ws = wb.active if idx == 0 else wb.create_sheet()
+        ws.title = sheet
+        extra = {"Translations": ("English version", 46), "Rejected": ("Rejected as", 16)}.get(sheet)
+        header = cols + ([extra] if extra else [])
+        for c, (name, width) in enumerate(header, 1):
+            cell = ws.cell(1, c, name)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = hdr_fill
+            cell.alignment = Alignment(vertical="center")
+            ws.column_dimensions[get_column_letter(c)].width = width
+        items.sort(key=lambda r: (category(r["vendor"])[0], r["vendor"].lower(), Path(r["path"]).name.lower()))
+        for i, r in enumerate(items, 2):
+            _, cat = category(r["vendor"])
+            vals = [cat, r["vendor"], Path(r["path"]).name, describe(r),
+                    DOC_TYPE_LABEL.get(r["text_doc_type"] or r["link_type"] or "other", ""),
+                    r["test_methods"] or "", r["pages"], r["language"] or "", r["first_url"]]
+            if sheet == "Translations":
+                vals.append(Path(r["english_path"]).name if r["english_path"] else "")
+            elif sheet == "Rejected":
+                vals.append(r["rejected"] or "")
+            for c, v in enumerate(vals, 1):
+                cell = ws.cell(i, c, v)
+                cell.alignment = Alignment(vertical="top", wrap_text=(c == 4))
+            doc = ws.cell(i, 3)
+            doc.hyperlink = r["path"]               # relative to the workbook (saved in the corpus root)
+            doc.font = Font(color="0563C1", underline="single")
+            if r["first_url"]:
+                ws.cell(i, 9).hyperlink = r["first_url"]
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(header))}{max(1, len(items) + 1)}"
+    out = root / "tds_catalog.xlsx"
+    try:
+        wb.save(out)
+    except PermissionError:
+        out = root / f"tds_catalog_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+        wb.save(out)
+        log.warning("tds_catalog.xlsx is open in Excel - wrote %s instead", out.name)
+    log.info("Catalog written: %s (%d documents, %d translations, %d rejected)", out,
+             len(sheets["Catalog"]), len(sheets["Translations"]), len(sheets["Rejected"]))
+    return out
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -1566,7 +1682,7 @@ def parse_args(argv=None):
     g.add_argument("--classify", action="store_true", help="tag downloaded PDFs (doc type, test methods)")
     g.add_argument("--all", action="store_true", help="discover + download + classify + export")
     g.add_argument("--status", action="store_true", help="print per-vendor counts")
-    g.add_argument("--export", action="store_true", help="write tds_manifest.csv")
+    g.add_argument("--export", action="store_true", help="write tds_manifest.csv and tds_catalog.xlsx")
     g.add_argument("--list-vendors", action="store_true", help="show vendors, categories and seed status")
     g.add_argument("--reorganize", action="store_true",
                    help="move existing PDFs into pdfs/<Category>/<Vendor>/ (also runs automatically with --download)")
@@ -1691,6 +1807,7 @@ def main(argv=None):
             reorganize_files(db, vendors_all, root)
         if args.export:
             export_manifest(db, vendors_all, root)
+            export_catalog_xlsx(db, vendors_all, root)
     except KeyboardInterrupt:
         log.warning("Interrupted - state saved; re-run the same command to resume.")
     if args.status or args.discover or args.download:
