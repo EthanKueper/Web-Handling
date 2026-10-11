@@ -44,8 +44,8 @@ D:\tds_corpus\
   pdfs\<Category>\<Vendor>\_rejected\       downloaded files whose text shows junk: reports, IR, press releases... (delete when happy)
   tds_crawler.db            SQLite (WAL): pages, pdf_links, files, vendors
   tds_manifest.csv          one row per file: vendor, categories, title, doc type, test methods, source URL...
-  tds_catalog.xlsx          Excel catalogue: Category | Vendor | Document (click to open) | Description | Type |
-                            Test methods | Pages | Language | Source URL  (sheets: Catalog, Translations, Rejected)
+  tds_catalog.xlsx          Excel catalogue: Summary + one sheet per category (Vendor | Document (click to open) |
+                            Description | Type | Test methods | Pages | Language | Source URL) + Translations + Rejected
   logs\tds_crawler_YYYYMMDD.log
 ```
 
@@ -53,29 +53,59 @@ Category folders come from the workbook sheet names: `1_Foil_Materials`, `2_Nonw
 
 ## Excel catalogue
 
-`--export` (and `--all`) also writes `tds_catalog.xlsx` in the corpus root. It has one row per PDF, with the material category, supplier and file name; the file name is a link, so clicking it opens the PDF. Each row also has a one-line description built from the document's opening text (for example *Technical data sheet: DuPont Pyralux AG - All-Polyimide Double-Sided Copper-Clad Laminate*), plus the type, test methods cited, page count, language and source URL. Kept documents are on the **Catalog** sheet. Translated copies are on **Translations**, with their English twin named, and junk is on **Rejected**, with the reason. Keep the workbook in the corpus root so the links work. If it's open in Excel during a run, a time-stamped copy is written instead.
+`--export` (and `--all`) also writes `tds_catalog.xlsx` in the corpus root. It has these sheets:
+
+- **Summary:** one row per material category, with counts of suppliers, documents, translations and rejected files. Click a category name to jump to its sheet.
+- **One sheet per category** (`1 Foil Materials`, `2 Nonwoven Fabrics`, `4 Polymer Films`, ... `8 Multi Category`): one row per kept PDF, with Vendor, Document, Description, Type, Test methods, Pages, Language and Source URL. The file name is a link, so clicking it opens the PDF. The description is built from the document's opening text, for example *Technical data sheet: DuPont Pyralux AG - All-Polyimide Double-Sided Copper-Clad Laminate*.
+- **Translations:** every non-English copy, with its category and the English version's file name, or `NOT FOUND`.
+- **Rejected:** junk files, with their category and the reason.
+
+Keep the workbook in the corpus root so the links work. If it's open in Excel during a run, a time-stamped copy is written instead.
 
 ## Foreign-language documents (English first)
 
-Many vendors post translated copies of the same sheet, such as `RO1200 Data Sheet - CN.pdf`. The crawler recognises these from a language code at the end of the filename (`- CN`, `_JP`, `(KR)`, `-DE`...), a language word (`_Chinese`), or a locale folder in the URL (`/zh-cn/`, `/ja/`), and always tries to get the English version first:
+The main supplier folder holds English documents only. For every non-English document, the crawler tries to find the English version first:
 
-1. If the English version is among the links found, only the English one is downloaded.
-2. If not, it tries likely English URLs: the same name without the code, or with `-EN` / `_EN`, or the `/en/` folder instead of `/ja/`.
-3. If no English version exists, the foreign copy is downloaded anyway so no data is lost, and the manifest flags it.
+1. **During the crawl.** A translated copy is recognised by a language code at the end of its filename (`- CN`, `_JP`, `(KR)`, `-DE`...), a language word (`_Chinese`), or a locale folder in its URL (`/zh-cn/`, `/ja/`). The English version is downloaded first.
+2. **Guessed URLs.** If the English version wasn't linked, likely English URLs are tried: the name without the code, `-EN`, `_EN`, `_english`, or the `/en/` folder instead of `/ja/`.
+3. **After `--classify`.** Documents found to be non-English from their text, even without a code in the name (for example `C1990_data.pdf` in Japanese), get the same URL guesses. Every non-English file is then matched against English files on disk by name.
 
-Translated copies already on disk whose English version later turns up are moved to `_translations\`, not deleted. Add `--keep-translations` to download every language version.
+Where the files go:
+- **English version found:** the English file goes in the main folder and the non-English copy in `_translations\`.
+- **No English version found:** the non-English copy still goes in `_translations\`, and the crawler moves on.
 
-After `--classify`, the manifest's `language` column is read from the PDF text: `en`, `zh`, `ja`, `ko`, `de`..., or `ja+en` for bilingual sheets. `english_version` gives the path of the English file for a translated copy, or `NOT FOUND` when a non-English sheet has no English counterpart. Filter on `NOT FOUND` to see which ones need a manual search or a request to the vendor.
+A file named like a translation (`- CN`) counts as non-English unless its text is purely English. Bilingual sheets, such as a Japanese sheet with full English text, stay in the main folder.
 
-## Junk filtering (corporate, IR, press)
+In `tds_manifest.csv` and on the catalogue's **Translations** sheet, `english_version` names the English file, or says `NOT FOUND`. The manifest's `language` column is read from the PDF text: `en`, `zh`, `ja`, `ko`, `de`..., or `ja+en` for bilingual sheets. `--keep-translations` turns language sorting off.
 
-Junk is filtered at three levels:
+## Junk filtering: allowlist (keep only what proves it's technical)
 
-1. **While crawling.** Pages in investor-relations, sustainability/CSR, news, press, careers and finance sections are deprioritised and rarely fetched.
-2. **Before download.** A PDF whose URL, or the page it was found on, sits in one of those sections (`/ir/`, `/sustainability/`, `/newsrelease/`...) is tagged `corporate` and skipped.
-3. **After download.** `--classify` reads each file's first pages. Files whose text shows an unwanted type are moved to `_rejected\`, not deleted. Unwanted types are integrated or annual reports, management plans, balance sheets and press releases, in English, Japanese, Chinese and Korean, plus anything else not in `--doc-types`. The manifest's `rejected_as` column says why. Use `--keep-rejected` to switch this off. Besides the page text, the check also reads each PDF's built-in title and filename (all Unicode-normalised, so full-width or decomposed Japanese characters still match). A file that can't be judged, because its text is garbled or it's image-only, is treated as junk when most of the same supplier's files with the same name pattern are junk; for example `3003_nmm.pdf` next to `2903_nmm.pdf`, `201903_nmm.pdf` and so on. These rules apply to every supplier. The log line `Text extraction: pypdf x.y` shows which PDF library version did the reading. Keep it current with `pip install -U pypdf`.
+Every downloaded file must show **positive evidence** that it's a technical document, or it goes to `_rejected\`. Nothing is kept just because it didn't look like junk. Evidence is scored from the first three pages:
 
-Running `--reclassify` re-checks every file already on disk with the current rules. It also pairs foreign files with their English twin when only the English file is marked, for example `C1990_data.pdf` (Japanese) and `C1990_data_english.pdf`.
+| Evidence | Examples |
+|---|---|
+| Test methods (2 points each) | ASTM D882, ISO 527, TAPPI T410, NWSP 100.1, IPC-TM-650, DIN, JIS |
+| Property values with units | g/m², µm, mm, mil, MPa, psi, N/25 mm, °C, %, g/cm³, g/10 min, GHz, Dk/Df, W/m·K, WVTR, Gurley, oz, inch |
+| Property names (English, Chinese, Japanese, Korean, German, French) | tensile, elongation, basis weight, peel, dielectric, porosity… 拉伸, 厚度, 介电, 引張, 比誘電率, 인장… |
+| Data-sheet headings (2 points) | Technical data, Typical properties, Specification, Construction, 技术数据, 物性表 |
+
+A file is **kept** when any of these is true:
+- it scores 4 or more;
+- its file name says it's technical (*data sheet, TDS, spec, grade, properties, selection guide, fabrication/processing guidelines, bulletin, brochure, flyer, catalogue, application note*);
+- its name contains a material word (*film, foil, laminate, paper, tape, nonwoven…*) and the text has at least some technical content;
+- it's the non-English copy of a kept English document.
+
+Image-only PDFs, which have no text to check, are kept only when their name says they're technical.
+
+A file is **rejected** when any of these is true:
+- its name shows it isn't a technical document: logos, CVs or résumés, business principles, codes of conduct, policies, privacy, AGM or board papers, org charts, calendars, invitations, press releases, news, annual or sustainability reports, ESG, ethics, careers, PFAS, conflict minerals or GHG letters, declarations, disclosures, testimonials, success stories or case studies. These names are also skipped at crawl time, so they're never downloaded.
+- its text is corporate, in any language: reports, management plans, balance sheets, press releases, maps.
+- it has no technical evidence.
+- it's a type you don't collect (`--doc-types`).
+
+The manifest's `rejected_as` column and the catalogue's **Rejected** sheet give the reason: `not technical (name)`, `corporate`, `no technical content`, `no readable text`, `sds`… For kept files, the **Evidence** column shows why each was kept, for example `12 test method(s); units: %, N/width, mm…; data-sheet heading`. Nothing is deleted. Use `--keep-rejected` to switch rejection off.
+
+Pages in investor-relations, sustainability, news, press, careers and finance sections are also skipped during the crawl. Text is Unicode-normalised. PDFs whose text extracts as shifted characters (`.BSLFU`) or as character codes (`/MT78/MT101`) are decoded before checking. Garbled files whose same-named siblings are corporate count as corporate too. `--classify` re-checks any file that hasn't been scored yet, and `--reclassify` re-checks everything.
 
 ## Distributors and brand filters
 
@@ -92,6 +122,8 @@ When a supplier's sheets are hosted on a distributor's site (Camden Copper and J
 **Classification.** After download, pypdf reads the text of pages 1–2 and records the document type from the text, the title, the page count, and the test methods cited: ASTM D882, ISO 527, TAPPI T410, NWSP 100.1, IPC-TM-650 2.4.8, DIN, JIS. The `method_families` column lets you separate film, paper and nonwoven data before comparing values. A file whose name says "data sheet", or whose first pages cite two or more test methods, is classed as a data sheet unless it is a safety data sheet.
 
 **Resumable.** Ctrl-C saves state, and running the same command again continues from there. A vendor that hits `--max-pages` keeps its queue, so another `--discover` run goes deeper.
+
+**Files you move or delete yourself.** If you move a PDF by hand, the crawler finds it again under `pdfs\` and records the new location. If you delete one, it's dropped from the database once and not downloaded again. If a large share of files seem missing, for example because the drive isn't connected, nothing is changed.
 
 **Revisions.** `--download --refresh` re-checks each downloaded PDF with ETag and If-Modified-Since. A changed sheet is saved as a new file and the old one is kept.
 
