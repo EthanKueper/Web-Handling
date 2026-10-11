@@ -617,6 +617,9 @@ class DB:
             c.execute("ALTER TABLE files ADD COLUMN rejected TEXT")
         if "summary" not in have_files:
             c.execute("ALTER TABLE files ADD COLUMN summary TEXT")
+        for col, typ in (("tech_score", "INTEGER"), ("evidence", "TEXT")):
+            if col not in have_files:
+                c.execute(f"ALTER TABLE files ADD COLUMN {col} {typ}")
         # pages used to be keyed by url alone, which mixed up vendors sharing a site
         pk = [r[1] for r in c.execute("PRAGMA table_info(pages)") if r[5]]
         if pk == ["url"]:
@@ -863,7 +866,7 @@ class VendorCrawler:
             return  # another company's sheet on a shared (distributor) site
         dtype = classify_doc_type(text)
         segs = {sg.lower() for u in (url, found_on or "") for sg in urlparse(u).path.split("/") if sg}
-        if segs & CORPORATE_SEGMENTS:
+        if segs & CORPORATE_SEGMENTS or NAME_JUNK_RE.search(stem_of(url)):
             dtype = "corporate"
         self.db.execute(
             "INSERT OR IGNORE INTO pdf_links(url, vendor, found_on, anchor, doc_type, first_seen, lang) "
@@ -1500,18 +1503,140 @@ def infer_from_siblings(db: DB) -> int:
     return n
 
 
+# ---- Allowlist: a file is kept only with positive evidence of technical content ----------------
+UNIT_PATTERNS = {
+    "g/m²": r"\bg\s*/\s*m\s*[²2]|\bgsm\b|\bg/sq\.?\s*m",
+    "µm": r"\d\s*(µm|μm|um|microns?)\b",
+    "mm": r"\d\s*mm\b",
+    "mil": r"\d\s*mils?\b",
+    "MPa/psi": r"\b(MPa|GPa|kPa|psi|ksi|kgf\s*/\s*cm)\b",
+    "N/width": r"\bN\s*/\s*(\d+\s*)?(mm|cm|in|m)\b|\blbf?\s*/\s*in\b|\bpli\b|\bgf\s*/",
+    "force": r"\d\s*(N|cN|kN|lbf)\b",
+    "°C/°F": r"°\s*[CF]\b|\bdeg\.?\s*[CF]\b",
+    "%": r"\d\s*%",
+    "density": r"(g\s*/\s*cm\s*[³3]|kg\s*/\s*m\s*[³3]|g/cc\b|lb\s*/\s*ft\s*[³3])",
+    "melt flow": r"(g\s*/\s*10\s*min|cm\s*[³3]\s*/\s*10\s*min)",
+    "electrical": r"\b(GHz|MHz|kV|V/mil|kV/mm|ohm|Ω|ohm-cm|Dk|Df)\b",
+    "thermal": r"\bW\s*/\s*m\s*[·.]?\s*K\b|\bppm\s*/\s*°?\s*C\b|\bCTE\b|\bTg\b",
+    "barrier": r"\b(cc|cm3|cm³|g)\s*/\s*(m\s*[²2]|100\s*in\s*[²2])\s*[·.]?\s*(day|24\s*h)",
+    "air perm.": r"(l\s*/\s*m\s*[²2]\s*/?\s*s\b|\bcfm\b|Gurley|s\s*/\s*100\s*ml)",
+    "oz/inch": r"\d\s*(oz|ounces?)\b|\d\s*(\"|in\.|inch(es)?)(\s|$)",
+}
+UNIT_RES = {k: re.compile(v) for k, v in UNIT_PATTERNS.items()}
+PROPERTY_RE = re.compile(
+    r"(tensile|elongation|thickness|caliper|basis weight|grammage|areal weight|density|modulus|tear|burst|"
+    r"porosity|permeability|peel|adhesion|dielectric|dissipation|loss tangent|thermal conductivity|viscosity|"
+    r"melt (flow|index)|haze|gloss|shrink|absorb|coefficient of friction|\bcof\b|puncture|elmendorf|opacity|"
+    r"brightness|moisture|wvtr|otr|heat seal|flammab|conductivity|hardness|shore|resistivity|yield|impact|"
+    r"elastic|stiffness|softness|bulk|filtration efficiency|pressure drop|penetration|surface resistance|tack|"
+    r"shear|release force|coat weight|roughness|annealing|temper|purity|roll length|construction|resin content|"
+    r"glass style|copper weight|prepreg|laminate|\bply\b|compression|durometer|cell size|fib(er|re)|"
+    r"拉伸|伸长|厚度|密度|介电|损耗|导热|热导|剥离|强度|硬度|性能|物性|测试方法|试验方法|典型值|规格|規格|特性|"
+    r"引張|伸び|厚さ|比誘電率|誘電正接|熱伝導|はく離|剥離|強度|硬さ|代表値|인장|두께|밀도|유전|강도|물성|"
+    r"zugfestigkeit|dicke|dichte|dehnung|flächengewicht|épaisseur|densité|allongement)", re.I)
+HEADER_RE = re.compile(
+    r"(technical data|data sheet|datasheet|typical (values|properties)|product data|properties|specification|"
+    r"test method|physical properties|mechanical properties|electrical properties|thermal properties|"
+    r"construction|grade\s+thickness|技术数据|技術データ|数据表|データシート|物性表|典型值|代表値|"
+    r"technisches datenblatt|fiche technique)", re.I)
+_B, _E = r"(?:^|[\W_])", r"(?:$|[\W_])"
+# strong: the name alone says it is a technical document
+NAME_STRONG_RE = re.compile(_B + r"(tds|pds|data[\s_-]*sheets?|datasheets?|spec(ification)?s?|grades?|properties|"
+                            r"technical|product[\s_-]*(data|guide|overview|selector|information)|selector|"
+                            r"selection[\s_-]*guide|fabrication|processing|guidelines?|bulletin|brochure|flyer|"
+                            r"catalog(ue)?|leaflet|sell[\s_-]*sheet|application[\s_-]*note|line[\s_-]*card)" + _E, re.I)
+# weak: a material word - only counts together with some technical text
+NAME_MATERIAL_RE = re.compile(_B + r"(laminates?|lam|prepregs?|films?|foils?|nonwovens?|papers?|tapes?|"
+                              r"adhesives?|resins?|fab(ric)?s?|webs?|membranes?|coatings?)" + _E, re.I)
+NAME_JUNK_RE = re.compile(_B + r"(logos?|curriculum|cv|resume|vcard|business[\s_-]*principles|"
+                          r"code[\s_-]*of[\s_-]*conduct|polic(y|ies)|privacy|terms[\s_-]*(and|&)[\s_-]*conditions|"
+                          r"agm|general[\s_-]*meeting|board[\s_-]*of[\s_-]*directors|remuneration|nomination|"
+                          r"articles[\s_-]*of[\s_-]*association|org(ani[sz]ation(al)?)?[\s_-]*chart|calendar|"
+                          r"invitation|agenda|press[\s_-]*releases?|news|annual[\s_-]*report|sustainab\w*|esg|"
+                          r"ethics|hotline|careers?|jobs?|pfas|conflict[\s_-]*minerals|ghg|greenhouse|"
+                          r"verification[\s_-]*opinion|letter|declaration|disclosure|testimonials?|"
+                          r"success[\s_-]*stor(y|ies)|case[\s_-]*stud(y|ies)|environmental[\s_-]*(bulletin|statement|compliance))" + _E, re.I)
+MIN_TECH_SCORE = 4
+
+
+def decode_mt(text: str) -> str:
+    """Some PDFs extract as '/MT78/MT101/MT119...' (decimal character codes) - decode them."""
+    if not text or text.count("/MT") < 20:
+        return text
+    return re.sub(r"/MT(\d{2,3})", lambda m: chr(int(m.group(1))) if 32 <= int(m.group(1)) < 1200 else " ", text)
+
+
+def technical_evidence(text: str) -> tuple[int, str]:
+    """Score how much the text looks like a technical document, plus a short human-readable reason."""
+    t = unicodedata.normalize("NFKC", text or "")[:8000]
+    methods, _ = extract_methods(t)
+    units = sorted(k for k, rx in UNIT_RES.items() if rx.search(t))
+    props = sorted({m.group(0).lower() for m in PROPERTY_RE.finditer(t)})
+    head = bool(HEADER_RE.search(t))
+    score = 2 * len(methods) + len(units) + min(len(props), 6) + (2 if head else 0)
+    parts = []
+    if methods:
+        parts.append(f"{len(methods)} test method(s)")
+    if units:
+        parts.append("units: " + ", ".join(units[:6]))
+    if props:
+        parts.append("properties: " + ", ".join(props[:5]))
+    if head:
+        parts.append("data-sheet heading")
+    return score, "; ".join(parts)
+
+
+def decide_keep(f, doc_types: set) -> str | None:
+    """None = keep, otherwise the reason it is rejected. f needs path, title, text_doc_type, tech_score,
+    language, english_path."""
+    dtype = f["text_doc_type"] or "other"
+    score = f["tech_score"] or 0
+    names = f"{Path(f['path']).stem} {f['title'] or ''}"
+    strong = bool(NAME_STRONG_RE.search(names))
+    material = bool(NAME_MATERIAL_RE.search(names))
+    if NAME_JUNK_RE.search(Path(f["path"]).stem) and score < 8:
+        return "not technical (name)"
+    if dtype == "corporate":
+        return "corporate"
+    if dtype not in doc_types and dtype != "unreadable":
+        return dtype                                    # e.g. sds / certificate, or types left out of --doc-types
+    twin = bool(f["english_path"])                      # non-English copy of a kept English document
+    if dtype == "unreadable":
+        return None if (strong or twin) else "no readable text"
+    foreign = bool(f["language"]) and not _is_english(f["language"])
+    if score >= MIN_TECH_SCORE or twin or strong or (material and (score >= 1 or foreign)):
+        return None
+    return "no technical content"
+
+
+def evidence_label(f) -> str:
+    """What the catalog shows in the Evidence column."""
+    if f["evidence"]:
+        return f["evidence"]
+    if f["rejected"]:
+        return ""
+    if f["english_path"]:
+        return "non-English copy of a kept English document"
+    names = f"{Path(f['path']).stem} {f['title'] or ''}"
+    if NAME_STRONG_RE.search(names):
+        return ("image-only PDF; " if f["text_doc_type"] == "unreadable" else "") + "technical file name"
+    return ""
+
+
 def reject_unwanted(db: DB, doc_types: list[str]) -> int:
-    """Files whose *text* shows a type you don't collect (corporate, SDS, certificate...) are flagged
-    rejected and moved to _rejected/ - never deleted. Unreadable files are kept."""
-    keep = set(doc_types) | {"unreadable"}
+    """ALLOWLIST: every downloaded file must show technical evidence (test methods, property values with
+    units, property names, data-sheet headings - or a technical file name when the text is unreadable).
+    Everything else goes to _rejected/ with the reason - never deleted."""
+    wanted = set(doc_types)
     n = 0
-    for r in db.query("SELECT sha256, text_doc_type, rejected FROM files WHERE text_doc_type IS NOT NULL"):
-        want = r["text_doc_type"] if r["text_doc_type"] not in keep else None
-        if (r["rejected"] or None) != want:
-            db.execute("UPDATE files SET rejected=? WHERE sha256=?", (want, r["sha256"]))
-            n += 1 if want else 0
+    for f in db.query("SELECT sha256, path, title, text_doc_type, tech_score, language, english_path, rejected "
+                      "FROM files WHERE text_doc_type IS NOT NULL"):
+        reason = decide_keep(f, wanted)
+        if (f["rejected"] or None) != reason:
+            db.execute("UPDATE files SET rejected=? WHERE sha256=?", (reason, f["sha256"]))
+            n += 1 if reason else 0
     if n:
-        log.info("Flagged %d downloaded file(s) as not wanted by their text (moved to _rejected/)", n)
+        log.info("Rejected %d file(s) without technical evidence or with junk content (moved to _rejected/)", n)
     return n
 
 
@@ -1657,7 +1782,8 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
         pass
     rows = db.query("SELECT f.sha256, f.path, l.doc_type AS link_type FROM files f "
                     "LEFT JOIN pdf_links l ON l.url = f.first_url" +
-                    ("" if redo else " WHERE f.classified_at IS NULL OR f.language IS NULL OR f.summary IS NULL"))
+                    ("" if redo else " WHERE f.classified_at IS NULL OR f.language IS NULL OR f.summary IS NULL"
+                                    " OR f.tech_score IS NULL"))
     n = 0
     for row in rows:
         if STOP.is_set():
@@ -1668,9 +1794,9 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
         try:
             rd = PdfReader(str(p))
             pages = len(rd.pages)
-            for pg in rd.pages[:2]:
+            for pg in rd.pages[:3]:
                 text += (pg.extract_text() or "") + "\n"
-            text = unshift_text(CONTROL_CHARS_RE.sub(" ", text))
+            text = unshift_text(decode_mt(CONTROL_CHARS_RE.sub(" ", text)))
             meta_title = (rd.metadata.title if rd.metadata else None) or ""
             first_line = next((l.strip() for l in text.splitlines() if len(l.strip()) > 3), "")
             title = (meta_title if len(meta_title.strip()) > 3 else first_line)[:200]
@@ -1686,15 +1812,17 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
                                        hints=f"{meta_t} {Path(row['path']).stem}")
         lang = detect_language(text)
         summary = make_summary(text, row["path"])
+        tscore, evid = technical_evidence(text)
         db.execute("UPDATE files SET pages=?, title=?, text_doc_type=?, test_methods=?, method_families=?, "
-                   "language=?, summary=?, classified_at=? WHERE sha256=?",
-                   (pages, title, dtype, "; ".join(methods), "; ".join(fams), lang, summary, utcnow(), row["sha256"]))
+                   "language=?, summary=?, tech_score=?, evidence=?, classified_at=? WHERE sha256=?",
+                   (pages, title, dtype, "; ".join(methods), "; ".join(fams), lang, summary, tscore, evid,
+                    utcnow(), row["sha256"]))
         n += 1
     log.info("Classified %d file(s)", n)
     infer_from_siblings(db)
+    pair_translations_by_text(db)
     if doc_types is not None and not keep_rejected:
         reject_unwanted(db, doc_types)
-    pair_translations_by_text(db)
     total, with_en = mark_non_english(db)
     if total:
         log.info("Non-English documents: %d (all in _translations/) - %d with an English version in the main "
@@ -1751,7 +1879,8 @@ def export_manifest(db: DB, vendors: dict[str, Vendor], root: Path) -> Path:
     out = root / "tds_manifest.csv"
     rows = db.query("""
         SELECT f.vendor, f.path, f.bytes, f.pages, f.title, f.text_doc_type, f.test_methods,
-               f.language, f.is_translation, f.english_path, f.rejected, l.lang AS link_lang,
+               f.language, f.is_translation, f.english_path, f.rejected, f.tech_score, f.evidence,
+               l.lang AS link_lang,
                f.method_families, f.first_url, f.added_at, l.doc_type AS link_doc_type, l.anchor,
                l.found_on, l.last_modified,
                (SELECT COUNT(*) FROM pdf_links x WHERE x.sha256 = f.sha256) AS url_count, f.sha256
@@ -1760,7 +1889,7 @@ def export_manifest(db: DB, vendors: dict[str, Vendor], root: Path) -> Path:
     with open(out, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
         w.writerow(["vendor", "categories", "category_folder", "path", "bytes", "pages", "title", "language",
-                    "is_translated_copy", "english_version", "rejected_as", "doc_type_from_text",
+                    "is_translated_copy", "english_version", "rejected_as", "tech_score", "evidence", "doc_type_from_text",
                     "doc_type_from_link", "test_methods", "method_families", "source_url", "anchor_text",
                     "found_on_page", "server_last_modified", "downloaded_at", "urls_with_same_file", "sha256"])
         for r in rows:
@@ -1772,7 +1901,7 @@ def export_manifest(db: DB, vendors: dict[str, Vendor], root: Path) -> Path:
             else:
                 eng = ""
             w.writerow([r["vendor"], cats.get(r["vendor"], ""), folders.get(r["vendor"], ""), r["path"], r["bytes"],
-                        r["pages"], r["title"], lang, "yes" if r["is_translation"] else "", eng, r["rejected"] or "",
+                        r["pages"], r["title"], lang, "yes" if r["is_translation"] else "", eng, r["rejected"] or "", r["tech_score"], r["evidence"] or "",
                         r["text_doc_type"], r["link_doc_type"], r["test_methods"], r["method_families"],
                         r["first_url"], r["anchor"], r["found_on"], r["last_modified"], r["added_at"],
                         r["url_count"], r["sha256"]])
@@ -1847,7 +1976,7 @@ def export_catalog_xlsx(db: DB, vendors: dict[str, Vendor], root: Path) -> Path 
         return cell
 
     doc_cols = [("Vendor", 30), ("Document", 46), ("Description", 70), ("Type", 22),
-                ("Test methods", 34), ("Pages", 7), ("Language", 9), ("Source URL", 50)]
+                ("Test methods", 34), ("Evidence", 44), ("Pages", 7), ("Language", 9), ("Source URL", 50)]
 
     def write_docs(ws, items, lead_category: bool, extra=None):
         cols = ([("Category", 20)] if lead_category else []) + doc_cols + ([extra[0]] if extra else [])
@@ -1857,7 +1986,7 @@ def export_catalog_xlsx(db: DB, vendors: dict[str, Vendor], root: Path) -> Path 
         for i, r in enumerate(items, 2):
             vals = ([category(r["vendor"])[1]] if lead_category else []) + [
                 r["vendor"], Path(r["path"]).name, describe(r), type_label(r), r["test_methods"] or "",
-                r["pages"], r["language"] or "", r["first_url"]]
+                evidence_label(r), r["pages"], r["language"] or "", r["first_url"]]
             if extra:
                 vals.append(extra[1](r))
             for c, v in enumerate(vals, 1):
@@ -1866,7 +1995,7 @@ def export_catalog_xlsx(db: DB, vendors: dict[str, Vendor], root: Path) -> Path 
             doc.hyperlink = r["path"]                 # relative to the workbook (saved in the corpus root)
             doc.font = link_font
             if r["first_url"]:
-                ws.cell(i, 8 + off).hyperlink = r["first_url"]
+                ws.cell(i, 9 + off).hyperlink = r["first_url"]
         ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{max(1, len(items) + 1)}"
 
     # Summary

@@ -78,15 +78,34 @@ A file named like a translation (`- CN`) counts as non-English unless its text i
 
 In `tds_manifest.csv` and on the catalogue's **Translations** sheet, `english_version` names the English file, or says `NOT FOUND`. The manifest's `language` column is read from the PDF text: `en`, `zh`, `ja`, `ko`, `de`..., or `ja+en` for bilingual sheets. `--keep-translations` turns language sorting off.
 
-## Junk filtering (corporate, IR, press)
+## Junk filtering: allowlist (keep only what proves it's technical)
 
-Junk is filtered at three levels:
+Every downloaded file must show **positive evidence** that it's a technical document, or it goes to `_rejected\`. Nothing is kept just because it didn't look like junk. Evidence is scored from the first three pages:
 
-1. **While crawling.** Pages in investor-relations, sustainability/CSR, news, press, careers and finance sections are deprioritised and rarely fetched.
-2. **Before download.** A PDF whose URL, or the page it was found on, sits in one of those sections (`/ir/`, `/sustainability/`, `/newsrelease/`...) is tagged `corporate` and skipped.
-3. **After download.** `--classify` reads each file's first pages. Files whose text shows an unwanted type are moved to `_rejected\`, not deleted. Unwanted types are integrated or annual reports, management plans, balance sheets and press releases, in English, Japanese, Chinese and Korean, plus anything else not in `--doc-types`. The manifest's `rejected_as` column says why. Use `--keep-rejected` to switch this off. Besides the page text, the check also reads each PDF's built-in title and filename (all Unicode-normalised, so full-width or decomposed Japanese characters still match). A file that can't be judged, because its text is garbled or it's image-only, is treated as junk when most of the same supplier's files with the same name pattern are junk; for example `3003_nmm.pdf` next to `2903_nmm.pdf`, `201903_nmm.pdf` and so on. These rules apply to every supplier. The log line `Text extraction: pypdf x.y` shows which PDF library version did the reading. Keep it current with `pip install -U pypdf`.
+| Evidence | Examples |
+|---|---|
+| Test methods (2 points each) | ASTM D882, ISO 527, TAPPI T410, NWSP 100.1, IPC-TM-650, DIN, JIS |
+| Property values with units | g/m², µm, mm, mil, MPa, psi, N/25 mm, °C, %, g/cm³, g/10 min, GHz, Dk/Df, W/m·K, WVTR, Gurley, oz, inch |
+| Property names (English, Chinese, Japanese, Korean, German, French) | tensile, elongation, basis weight, peel, dielectric, porosity… 拉伸, 厚度, 介电, 引張, 比誘電率, 인장… |
+| Data-sheet headings (2 points) | Technical data, Typical properties, Specification, Construction, 技术数据, 物性表 |
 
-Running `--reclassify` re-checks every file already on disk with the current rules. It also pairs foreign files with their English twin when only the English file is marked, for example `C1990_data.pdf` (Japanese) and `C1990_data_english.pdf`.
+A file is **kept** when any of these is true:
+- it scores 4 or more;
+- its file name says it's technical (*data sheet, TDS, spec, grade, properties, selection guide, fabrication/processing guidelines, bulletin, brochure, flyer, catalogue, application note*);
+- its name contains a material word (*film, foil, laminate, paper, tape, nonwoven…*) and the text has at least some technical content;
+- it's the non-English copy of a kept English document.
+
+Image-only PDFs, which have no text to check, are kept only when their name says they're technical.
+
+A file is **rejected** when any of these is true:
+- its name shows it isn't a technical document: logos, CVs or résumés, business principles, codes of conduct, policies, privacy, AGM or board papers, org charts, calendars, invitations, press releases, news, annual or sustainability reports, ESG, ethics, careers, PFAS, conflict minerals or GHG letters, declarations, disclosures, testimonials, success stories or case studies. These names are also skipped at crawl time, so they're never downloaded.
+- its text is corporate, in any language: reports, management plans, balance sheets, press releases, maps.
+- it has no technical evidence.
+- it's a type you don't collect (`--doc-types`).
+
+The manifest's `rejected_as` column and the catalogue's **Rejected** sheet give the reason: `not technical (name)`, `corporate`, `no technical content`, `no readable text`, `sds`… For kept files, the **Evidence** column shows why each was kept, for example `12 test method(s); units: %, N/width, mm…; data-sheet heading`. Nothing is deleted. Use `--keep-rejected` to switch rejection off.
+
+Pages in investor-relations, sustainability, news, press, careers and finance sections are also skipped during the crawl. Text is Unicode-normalised. PDFs whose text extracts as shifted characters (`.BSLFU`) or as character codes (`/MT78/MT101`) are decoded before checking. Garbled files whose same-named siblings are corporate count as corporate too. `--classify` re-checks any file that hasn't been scored yet, and `--reclassify` re-checks everything.
 
 ## Distributors and brand filters
 
