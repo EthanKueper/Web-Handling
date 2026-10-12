@@ -72,6 +72,8 @@ DEFAULT_WORKBOOK = Path(r"D:\tds_corpus\input\Vendors_With_Technical_Sheets_By_M
 DEFAULT_SEEDS = Path(r"D:\tds_corpus\input\vendor_seeds.csv")
 
 USER_AGENT_BASE = "TDSCollector/1.0 (technical datasheet research)"
+BUILD = "2026-10-11 r8"        # shown at startup - tells you which version of the script actually ran
+RULES_VERSION = 8              # bump when classification rules change: files are re-scored automatically
 DEFAULT_DELAY_S = 2.0          # min seconds between requests to the same vendor
 DEFAULT_MAX_PAGES = 400        # HTML pages fetched per vendor per discovery run
 DEFAULT_MAX_DEPTH = 4
@@ -148,7 +150,7 @@ DOC_TYPE_PATTERNS = [
     ("brochure", re.compile(r"\b(brochure|catalog|catalogue|flyer|leaflet|overview|"
                             r"selector|selection[\s_-]guide|portfolio|line[\s_-]?card)\b", re.I)),
 ]
-ALL_DOC_TYPES = ["tds", "sds", "brochure", "certificate", "corporate", "other"]
+ALL_DOC_TYPES = ["tds", "sds", "brochure", "certificate", "corporate", "commercial", "other"]
 # Stricter certificate test for PDF *text* (TDS bodies often mention REACH/RoHS/FDA compliance)
 TEXT_CERT_RE = re.compile(r"(certificate of (analysis|conformance|conformity|compliance)|declaration of|"
                           r"\bstatement (of|on|regarding)\b|conflict minerals|to whom it may concern|"
@@ -156,27 +158,39 @@ TEXT_CERT_RE = re.compile(r"(certificate of (analysis|conformance|conformity|com
 
 # --- translated copies (English-first) ----------------------------------------
 # "X - CN.pdf", "X_JP.pdf", "X (KR).pdf", "X-DE-2.pdf"... (upper-case codes only, to avoid product codes)
-LANG_CODES = {"CN": "zh", "ZH": "zh", "TW": "zh", "CHS": "zh", "CHT": "zh", "JP": "ja", "JA": "ja",
+LANG_CODES = {"CHIN": "zh", "CN": "zh", "ZH": "zh", "TW": "zh", "CHS": "zh", "CHT": "zh", "JP": "ja", "JA": "ja",
               "KR": "ko", "KO": "ko", "DE": "de", "FR": "fr", "ES": "es", "IT": "it", "PT": "pt",
               "BR": "pt", "RU": "ru", "PL": "pl", "TR": "tr", "CZ": "cs", "NL": "nl", "SE": "sv",
               "HU": "hu"}
 LANG_WORDS = {"chinese": "zh", "japanese": "ja", "korean": "ko", "german": "de", "deutsch": "de",
               "french": "fr", "francais": "fr", "spanish": "es", "espanol": "es", "italian": "it",
               "italiano": "it", "portuguese": "pt", "russian": "ru", "polish": "pl", "turkish": "tr"}
+_TRAIL = r"(?:[\s_\-.]+(?i:\d{1,8}|web|final|rd|print|lowres|v\d+))*"
 TRANSLATION_CODE_RE = re.compile(
-    r"^(?P<base>.+?)(?:[\s_\-.]+\(?|\()(?P<code>" + "|".join(sorted(LANG_CODES, key=len, reverse=True)) +
-    r")\)?(?:[\s_\-]?\d{1,2})?$")
+    r"^(?P<base>.+?)(?:[\s_\-.]+\(?|\()(?P<code>" + "|".join(sorted(LANG_CODES, key=len, reverse=True) + ["CHIN"]) +
+    r")\)?(?:[\s_\-]?\d{1,2})?" + _TRAIL + "$")
 TRANSLATION_WORD_RE = re.compile(
     r"^(?P<base>.+?)[\s_\-(]+(?P<word>" + "|".join(LANG_WORDS) + r")\)?$", re.I)
 ENGLISH_MARK_RE = re.compile(r"[\s_\-.]+\(?(EN|ENG|[Ee]nglish|en|eng|US|GB|UK)\)?(?:[\s_\-]?\d{1,2})?$")
 COLLISION_SUFFIX_RE = re.compile(r"_[0-9a-f]{8}$")
 GOOD_STATES = ("downloaded", "duplicate", "unchanged")
+# Supplier / purchasing / logistics paperwork - never technical documents
+COMMERCIAL_TEXT_RE = re.compile(
+    r"(invoic(e|es|ing)|credit notes?|order confirmations?|purchase orders?|purchasing (terms|conditions)|"
+    r"general (terms|conditions) of (purchase|sale|delivery)|terms and conditions|delivery (guidelines|address|"
+    r"addresses|conditions|instructions|note)|goods receipt|incoterms|supplier (inquiry|portal|code of conduct|"
+    r"self[- ]assessment|registration|questionnaire)|dangerous goods|\bADR\b.{0,40}\bIATA|IMDG|cargomarket|"
+    r"cargo market|freight|forwarder|unloading|opening hours|map directions|commodity groups?|human rights|"
+    r"due diligence|supply chain act|"
+    r"rechnungsstellung|gutschrift|auftragsbest[äa]tigung|einkaufsbedingungen|lieferbedingungen|"
+    r"anlieferung|lieferanschrift|warengruppe|grundsatzerkl[äa]rung|sorgfaltspflicht|lieferkettengesetz|"
+    r"发票|订单确认|采购条款|采购条件|請求書|注文書|購買条件)", re.I)
 CORPORATE_TEXT_RE = re.compile(
     r"(integrated report|annual report|sustainability report|medium\s*-?\s*term\s+management|"
     r"long\s*-?\s*term\s+vision|management plan|balance sheet|financial results|financial statements|securities report|shareholders|"
     r"corporate governance report|esg data|access map|booth map|floor plan|site map|notice of|"
     r"貸借対照表|損益計算書|中期経営計画|長期ビジョン|統合報告|決算|株主|有価証券報告書|各\s*位|ステークホルダー|"
-    r"お問い合わせ先|ニュースリリース|プレスリリース|会社概要|アクセスマップ|ブースマップ|計算書類|附属明細書|"
+    r"ニュースリリース|プレスリリース|会社概要|アクセスマップ|ブースマップ|計算書類|附属明細書|"
     r"委託生産|お知らせ|経営計画|事業報告|"
     r"资产负债表|年度报告|可持续发展报告|中期经营计划|重大课题|公司治理|"
     r"재무상태표|지속가능경영보고서|사업보고서)", re.I)
@@ -297,10 +311,16 @@ def stem_of(url: str) -> str:
     return name[:-4] if name.lower().endswith(".pdf") else name
 
 
+LANG_TOKEN_RE = re.compile(r"(?:(?<=^)|(?<=[\s_\-.(]))(?:EN|ENG|ENGL|ENGLISH|ENGLISCH|DE|GER|DEU|DEUTSCH|FR|ES|IT|"
+                           r"CN|CHN|CHIN|CHINESE|ZH|JP|JA|KR|KO|RU|PL|PT|TR|NL|D|E|GB|US|UK)(?=$|[\s_\-.)])", re.I)
+
+
 def match_key(stem: str) -> str:
-    """Comparable key for a filename stem: case/punctuation-free, English markers removed."""
+    """Comparable key for a filename stem: case/punctuation-free, language markers removed wherever they
+    appear ('Extruder D_EN_2025' == 'Extruder D_DE_2025', 'Duese Platte E_rd' == 'Duese Platte D_rd')."""
     stem = COLLISION_SUFFIX_RE.sub("", stem.strip())
     stem = ENGLISH_MARK_RE.sub("", stem)
+    stem = LANG_TOKEN_RE.sub(" ", stem)
     return re.sub(r"[^a-z0-9]+", "", stem.lower())
 
 
@@ -334,7 +354,7 @@ def translation_info(url: str) -> tuple[str, str, list[str]]:
             sg = list(segs)
             sg[loc_idx] = en
             guesses.append(f"{p.scheme}://{p.netloc}{'/'.join(sg)}")
-    return lang, match_key(base), list(dict.fromkeys(g for g in guesses if canon_url(g) != canon_url(url)))
+    return lang, match_key(stem), list(dict.fromkeys(g for g in guesses if canon_url(g) != canon_url(url)))
 
 
 ENGLISH_NAME_SUFFIXES = ("_english", "_en", "-en", "_EN", "-EN")
@@ -351,8 +371,7 @@ def name_lang(path: str) -> str:
 
 def foreign_key(path: str) -> str:
     """Match key of the English twin we'd expect for a (possibly suffixed) foreign file name."""
-    lang, key, _ = translation_info(_name_url(path))
-    return key if lang else match_key(Path(path).stem)
+    return match_key(Path(path).stem)       # language tokens are removed wherever they appear
 
 
 def english_url_guesses(url: str) -> list[str]:
@@ -617,7 +636,8 @@ class DB:
             c.execute("ALTER TABLE files ADD COLUMN rejected TEXT")
         if "summary" not in have_files:
             c.execute("ALTER TABLE files ADD COLUMN summary TEXT")
-        for col, typ in (("tech_score", "INTEGER"), ("evidence", "TEXT")):
+        for col, typ in (("tech_score", "INTEGER"), ("evidence", "TEXT"), ("pdf_title", "TEXT"),
+                         ("text_chars", "INTEGER"), ("rules_version", "INTEGER")):
             if col not in have_files:
                 c.execute(f"ALTER TABLE files ADD COLUMN {col} {typ}")
         # pages used to be keyed by url alone, which mixed up vendors sharing a site
@@ -1445,6 +1465,8 @@ def classify_text_doc_type(text: str, link_type: str = "", n_methods: int = 0, h
     hints = unicodedata.normalize("NFKC", hints or "")
     if link_type == "corporate" or (hints and CORPORATE_TEXT_RE.search(hints)):
         return "corporate"
+    if COMMERCIAL_TEXT_RE.search(hints or "") or COMMERCIAL_TEXT_RE.search(text[:2500]):
+        return "commercial"
     if not text.strip():
         return "unreadable"
     rx = dict(DOC_TYPE_PATTERNS)
@@ -1527,24 +1549,27 @@ PROPERTY_RE = re.compile(
     r"(tensile|elongation|thickness|caliper|basis weight|grammage|areal weight|density|modulus|tear|burst|"
     r"porosity|permeability|peel|adhesion|dielectric|dissipation|loss tangent|thermal conductivity|viscosity|"
     r"melt (flow|index)|haze|gloss|shrink|absorb|coefficient of friction|\bcof\b|puncture|elmendorf|opacity|"
-    r"brightness|moisture|wvtr|otr|heat seal|flammab|conductivity|hardness|shore|resistivity|yield|impact|"
-    r"elastic|stiffness|softness|bulk|filtration efficiency|pressure drop|penetration|surface resistance|tack|"
-    r"shear|release force|coat weight|roughness|annealing|temper|purity|roll length|construction|resin content|"
+    r"brightness|moisture|wvtr|otr|heat seal|flammab|conductivity|hardness|shore|resistivity|"
+    r"yield (strength|stress|point)|impact (strength|resistance)|\belastic modulus|stiffness|softness|"
+    r"bulk density|filtration efficiency|pressure drop|penetration|surface resistance|\btack\b|"
+    r"shear|release force|coat weight|roughness|annealing|\btemper(s|ed)?\b|purity|roll length|construction|resin content|"
     r"glass style|copper weight|prepreg|laminate|\bply\b|compression|durometer|cell size|fib(er|re)|"
     r"拉伸|伸长|厚度|密度|介电|损耗|导热|热导|剥离|强度|硬度|性能|物性|测试方法|试验方法|典型值|规格|規格|特性|"
     r"引張|伸び|厚さ|比誘電率|誘電正接|熱伝導|はく離|剥離|強度|硬さ|代表値|인장|두께|밀도|유전|강도|물성|"
     r"zugfestigkeit|dicke|dichte|dehnung|flächengewicht|épaisseur|densité|allongement)", re.I)
 HEADER_RE = re.compile(
-    r"(technical data|data sheet|datasheet|typical (values|properties)|product data|properties|specification|"
+    r"(technical data|data sheet|datasheet|typical (values|properties)|product data|material properties|"
     r"test method|physical properties|mechanical properties|electrical properties|thermal properties|"
-    r"construction|grade\s+thickness|技术数据|技術データ|数据表|データシート|物性表|典型值|代表値|"
+    r"grade\s+thickness|technische daten|技术数据|技術データ|数据表|データシート|物性表|典型值|代表値|"
     r"technisches datenblatt|fiche technique)", re.I)
 _B, _E = r"(?:^|[\W_])", r"(?:$|[\W_])"
 # strong: the name alone says it is a technical document
 NAME_STRONG_RE = re.compile(_B + r"(tds|pds|data[\s_-]*sheets?|datasheets?|spec(ification)?s?|grades?|properties|"
                             r"technical|product[\s_-]*(data|guide|overview|selector|information)|selector|"
                             r"selection[\s_-]*guide|fabrication|processing|guidelines?|bulletin|brochure|flyer|"
-                            r"catalog(ue)?|leaflet|sell[\s_-]*sheet|application[\s_-]*note|line[\s_-]*card)" + _E, re.I)
+                            r"catalog(ue)?|leaflet|sell[\s_-]*sheet|application[\s_-]*note|line[\s_-]*card|fact[\s_-]*sheet|"
+                            r"factsheet|brosch(ü|ue|u)re|datenblatt|prospekt|technische[\s_-]*daten|"
+                            r"fiche[\s_-]*technique|ficha[\s_-]*t[ée]cnica)" + _E, re.I)
 # weak: a material word - only counts together with some technical text
 NAME_MATERIAL_RE = re.compile(_B + r"(laminates?|lam|prepregs?|films?|foils?|nonwovens?|papers?|tapes?|"
                               r"adhesives?|resins?|fab(ric)?s?|webs?|membranes?|coatings?)" + _E, re.I)
@@ -1555,8 +1580,26 @@ NAME_JUNK_RE = re.compile(_B + r"(logos?|curriculum|cv|resume|vcard|business[\s_
                           r"invitation|agenda|press[\s_-]*releases?|news|annual[\s_-]*report|sustainab\w*|esg|"
                           r"ethics|hotline|careers?|jobs?|pfas|conflict[\s_-]*minerals|ghg|greenhouse|"
                           r"verification[\s_-]*opinion|letter|declaration|disclosure|testimonials?|"
-                          r"success[\s_-]*stor(y|ies)|case[\s_-]*stud(y|ies)|environmental[\s_-]*(bulletin|statement|compliance))" + _E, re.I)
-MIN_TECH_SCORE = 4
+                          r"success[\s_-]*stor(y|ies)|case[\s_-]*stud(y|ies)|environmental[\s_-]*(bulletin|statement|compliance)|"
+                          r"invoic\w*|order[\s_-]*confirmations?|purchas\w*|delivery[\s_-]*(guidelines|conditions|"
+                          r"instructions)|supplier[\s_-]*(inquiry|form|code|portal)|cargo\w*|logistics|shipping|"
+                          r"registration|human[\s_-]*rights|grundsatzerkl\w*|warengruppe\w*|einkauf\w*|liefer\w*|"
+                          r"terms[\s_-]*(of|and)[\s_-]*\w+)" + _E, re.I)
+MACHINE_RE = re.compile(
+    r"(\d\s*(m/min|mpm|ft/min|kg/h|kg/hr|lb/h|t/h|kW|rpm|1/min|min-1)\b|line speed|working width|web width|"
+    r"net width|throughput|screw diameter|\bL/D\b|die width|winding (speed|diameter)|max\.? (speed|width)|"
+    r"roll diameter|unwind|rewind|slitting width|production speed|output rate)", re.I)
+# equipment / component vocabulary - product documents of machine makers
+EQUIP_RE = re.compile(
+    r"(extruders?|screws?|barrels?|flat dies?|die heads?|die lips?|feedblocks?|coextrusion|spinnerets?|"
+    r"spinning beam|meltblown|spunbond|spunlace|winders?|rewinders?|unwinders?|slitters?|laminators?|coaters?|"
+    r"coating heads?|calenders?|tenter|stretching|chill rolls?|corona|web guid\w*|tension control|"
+    r"cast (film|sheet) lines?|blown film lines?|sheet lines?|nonwoven lines?|mdo|gear pumps?|screen changers?|"
+    r"melt pumps?|thickness gauges?|printing (units?|press)|flexo|gravure|slot[- ]die|"
+    r"extruder|schnecke|zylinder|düse|duese|wickler|kaschier|beschicht|"
+    r"挤出机|螺杆|模头|喷丝板|收卷|分切|涂布|复合机|流延|吹膜)", re.I)
+MIN_TECH_SCORE = 3
+LOW_TEXT_CHARS = 400        # less text than this = mostly images; the name may decide
 
 
 def decode_mt(text: str) -> str:
@@ -1568,12 +1611,21 @@ def decode_mt(text: str) -> str:
 
 def technical_evidence(text: str) -> tuple[int, str]:
     """Score how much the text looks like a technical document, plus a short human-readable reason."""
-    t = unicodedata.normalize("NFKC", text or "")[:8000]
+    t = unicodedata.normalize("NFKC", text or "")[:15000]
     methods, _ = extract_methods(t)
     units = sorted(k for k, rx in UNIT_RES.items() if rx.search(t))
     props = sorted({m.group(0).lower() for m in PROPERTY_RE.finditer(t)})
     head = bool(HEADER_RE.search(t))
-    score = 2 * len(methods) + len(units) + min(len(props), 6) + (2 if head else 0)
+    machine = sorted({m.group(0).lower() for m in MACHINE_RE.finditer(t)})
+    equip = sorted({m.group(0).lower() for m in EQUIP_RE.finditer(t)})
+    score = (2 * len(methods) + len(units) + min(len(props), 6) + (2 if head else 0) + min(len(machine), 4)
+             + min(len(equip), 3))
+    # substance: real data, not just a stray unit or a technical-sounding word
+    substantive = (bool(methods) or len(props) >= 3 or (len(props) >= 2 and (units or head))
+                   or len(machine) >= 2 or (len(props) >= 1 and len(units) >= 2)
+                   or (len(equip) >= 3 and (units or machine or props)))   # machine / component product docs
+    if not substantive:
+        score = min(score, MIN_TECH_SCORE - 1)
     parts = []
     if methods:
         parts.append(f"{len(methods)} test method(s)")
@@ -1581,32 +1633,60 @@ def technical_evidence(text: str) -> tuple[int, str]:
         parts.append("units: " + ", ".join(units[:6]))
     if props:
         parts.append("properties: " + ", ".join(props[:5]))
+    if machine:
+        parts.append("machine specs: " + ", ".join(machine[:4]))
+    if equip:
+        parts.append("equipment: " + ", ".join(equip[:4]))
     if head:
         parts.append("data-sheet heading")
     return score, "; ".join(parts)
 
 
-def decide_keep(f, doc_types: set) -> str | None:
-    """None = keep, otherwise the reason it is rejected. f needs path, title, text_doc_type, tech_score,
-    language, english_path."""
+def decide_keep(f, doc_types: set, equipment_vendor: bool = False) -> str | None:
+    """None = keep, otherwise the reason it is rejected. The CONTENT decides; a technical file name only
+    helps when the PDF has (almost) no text to judge. f needs path, pdf_title, text_doc_type, tech_score,
+    text_chars, language, english_path."""
     dtype = f["text_doc_type"] or "other"
     score = f["tech_score"] or 0
-    names = f"{Path(f['path']).stem} {f['title'] or ''}"
-    strong = bool(NAME_STRONG_RE.search(names))
-    material = bool(NAME_MATERIAL_RE.search(names))
-    if NAME_JUNK_RE.search(Path(f["path"]).stem) and score < 8:
+    stem = Path(f["path"]).stem
+    names = f"{stem} {f['pdf_title'] or ''}"
+    if NAME_JUNK_RE.search(stem) and score < 8:
         return "not technical (name)"
-    if dtype == "corporate":
-        return "corporate"
+    if dtype in ("corporate", "commercial"):
+        return dtype
     if dtype not in doc_types and dtype != "unreadable":
         return dtype                                    # e.g. sds / certificate, or types left out of --doc-types
     twin = bool(f["english_path"])                      # non-English copy of a kept English document
-    if dtype == "unreadable":
-        return None if (strong or twin) else "no readable text"
+    if twin:
+        return None
+    low_text = dtype == "unreadable" or (f["text_chars"] or 0) < LOW_TEXT_CHARS
+    if score >= MIN_TECH_SCORE:
+        return None
+    strong = bool(NAME_STRONG_RE.search(names))
+    if equipment_vendor:
+        # Machine makers: the brochure IS the technical document. Anything that talks about their
+        # machines/components (and already passed the commercial / corporate / junk-name checks) stays.
+        ev = f["evidence"] or ""
+        if "equipment:" in ev or "machine specs:" in ev or strong or name_lang(f["path"]):
+            return None
+    if low_text:
+        return None if strong else "no readable text"
     foreign = bool(f["language"]) and not _is_english(f["language"])
-    if score >= MIN_TECH_SCORE or twin or strong or (material and (score >= 1 or foreign)):
+    # commercial papers and junk names were already rejected above, so a technical name plus some
+    # technical text (or CJK text the evidence words may not cover) is enough
+    if strong and (score >= 1 or foreign):
         return None
     return "no technical content"
+
+
+def equipment_vendors(vendors: dict) -> set:
+    """Vendors listed on the Equipment & Machinery or Process Technology sheets (machine makers)."""
+    out = set()
+    for v in vendors.values():
+        cats = " ".join(v.categories).lower() + " " + " ".join(v.category_folders).lower()
+        if "equipment" in cats or "machinery" in cats or "process technology" in cats or "process_technology" in cats:
+            out.add(v.name)
+    return out
 
 
 def evidence_label(f) -> str:
@@ -1617,21 +1697,21 @@ def evidence_label(f) -> str:
         return ""
     if f["english_path"]:
         return "non-English copy of a kept English document"
-    names = f"{Path(f['path']).stem} {f['title'] or ''}"
+    names = f"{Path(f['path']).stem} {f['pdf_title'] or ''}"
     if NAME_STRONG_RE.search(names):
         return ("image-only PDF; " if f["text_doc_type"] == "unreadable" else "") + "technical file name"
     return ""
 
 
-def reject_unwanted(db: DB, doc_types: list[str]) -> int:
+def reject_unwanted(db: DB, doc_types: list[str], equipment_vendors: set | None = None) -> int:
     """ALLOWLIST: every downloaded file must show technical evidence (test methods, property values with
     units, property names, data-sheet headings - or a technical file name when the text is unreadable).
     Everything else goes to _rejected/ with the reason - never deleted."""
     wanted = set(doc_types)
     n = 0
-    for f in db.query("SELECT sha256, path, title, text_doc_type, tech_score, language, english_path, rejected "
-                      "FROM files WHERE text_doc_type IS NOT NULL"):
-        reason = decide_keep(f, wanted)
+    for f in db.query("SELECT sha256, path, title, pdf_title, text_doc_type, tech_score, text_chars, language, "
+                      "english_path, rejected, evidence, vendor FROM files WHERE text_doc_type IS NOT NULL"):
+        reason = decide_keep(f, wanted, equipment_vendor=f["vendor"] in (equipment_vendors or set()))
         if (f["rejected"] or None) != reason:
             db.execute("UPDATE files SET rejected=? WHERE sha256=?", (reason, f["sha256"]))
             n += 1 if reason else 0
@@ -1696,7 +1776,8 @@ def queue_english_guesses(db: DB, vendors: dict[str, Vendor], only: set | None =
     by_name = {v.name: v for v in vendors.values()}
     hit: dict[str, Vendor] = {}
     for f in db.query("SELECT f.vendor, f.first_url, l.doc_type FROM files f LEFT JOIN pdf_links l ON "
-                      "l.url = f.first_url WHERE f.is_translation=1 AND f.english_path IS NULL AND f.rejected IS NULL"):
+                      "l.url = f.first_url WHERE f.is_translation=1 AND f.english_path IS NULL AND "
+                      "(f.rejected IS NULL OR f.rejected IN ('no technical content', 'no readable text'))"):
         url, v = f["first_url"], by_name.get(f["vendor"])
         if only is not None and f["vendor"] not in only:
             continue
@@ -1768,7 +1849,8 @@ def make_summary(text: str, filename: str) -> str:
     return CONTROL_CHARS_RE.sub(" ", out)[:180]
 
 
-def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_rejected: bool = False) -> int:
+def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_rejected: bool = False,
+                   equipment_vendors: set | None = None) -> int:
     try:
         from pypdf import PdfReader
     except ImportError:
@@ -1783,7 +1865,8 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
     rows = db.query("SELECT f.sha256, f.path, l.doc_type AS link_type FROM files f "
                     "LEFT JOIN pdf_links l ON l.url = f.first_url" +
                     ("" if redo else " WHERE f.classified_at IS NULL OR f.language IS NULL OR f.summary IS NULL"
-                                    " OR f.tech_score IS NULL"))
+                                    " OR f.tech_score IS NULL OR f.text_chars IS NULL"
+                                    f" OR COALESCE(f.rules_version, 0) <> {RULES_VERSION}"))
     n = 0
     for row in rows:
         if STOP.is_set():
@@ -1794,7 +1877,7 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
         try:
             rd = PdfReader(str(p))
             pages = len(rd.pages)
-            for pg in rd.pages[:3]:
+            for pg in rd.pages[:6]:
                 text += (pg.extract_text() or "") + "\n"
             text = unshift_text(decode_mt(CONTROL_CHARS_RE.sub(" ", text)))
             meta_title = (rd.metadata.title if rd.metadata else None) or ""
@@ -1814,15 +1897,16 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
         summary = make_summary(text, row["path"])
         tscore, evid = technical_evidence(text)
         db.execute("UPDATE files SET pages=?, title=?, text_doc_type=?, test_methods=?, method_families=?, "
-                   "language=?, summary=?, tech_score=?, evidence=?, classified_at=? WHERE sha256=?",
+                   "language=?, summary=?, tech_score=?, evidence=?, pdf_title=?, text_chars=?, rules_version=?, "
+                   "classified_at=? WHERE sha256=?",
                    (pages, title, dtype, "; ".join(methods), "; ".join(fams), lang, summary, tscore, evid,
-                    utcnow(), row["sha256"]))
+                    meta_t[:200], len(re.sub(r"\s", "", text)), RULES_VERSION, utcnow(), row["sha256"]))
         n += 1
     log.info("Classified %d file(s)", n)
     infer_from_siblings(db)
     pair_translations_by_text(db)
     if doc_types is not None and not keep_rejected:
-        reject_unwanted(db, doc_types)
+        reject_unwanted(db, doc_types, equipment_vendors)
     total, with_en = mark_non_english(db)
     if total:
         log.info("Non-English documents: %d (all in _translations/) - %d with an English version in the main "
@@ -1911,6 +1995,7 @@ def export_manifest(db: DB, vendors: dict[str, Vendor], root: Path) -> Path:
 
 DOC_TYPE_LABEL = {"tds": "Technical data sheet", "brochure": "Brochure / selector guide", "sds": "Safety data sheet",
                   "certificate": "Certificate / statement", "corporate": "Corporate document",
+                  "commercial": "Commercial / supplier document",
                   "other": "Technical document", "unreadable": "Scanned / image-only PDF"}
 
 
@@ -2156,6 +2241,7 @@ def main(argv=None):
     root = args.root
     root.mkdir(parents=True, exist_ok=True)
     setup_logging(root, args.verbose)
+    log.info("tds_crawler_v1 build %s (rules v%d) - %s", BUILD, RULES_VERSION, Path(__file__).resolve())
     vendors_all = load_workbook_vendors(args.workbook)
     merge_seeds(vendors_all, args.seeds)
     db = DB(root / "tds_crawler.db")
@@ -2200,19 +2286,24 @@ def main(argv=None):
             reorganize_files(db, vendors_all, root)   # files into place; non-English copies -> _translations/
         if args.classify and not STOP.is_set():
             backfill_link_lang(db)
-            classify_files(db, root, redo=args.reclassify, doc_types=args.doc_types, keep_rejected=args.keep_rejected)
+            classify_files(db, root, redo=args.reclassify, doc_types=args.doc_types, keep_rejected=args.keep_rejected,
+                           equipment_vendors=equipment_vendors(vendors_all))
             if args.download and not args.keep_translations and not STOP.is_set():
                 more = queue_english_guesses(db, vendors_all, only={v.name for v in chosen})
                 if more:
                     log.info("Looking for English versions of non-English documents (%d vendor(s))", len(more))
                     run_parallel(lambda v: download_vendor(v, db, args, root), more, args.workers)
-                    classify_files(db, root, redo=False, doc_types=args.doc_types, keep_rejected=args.keep_rejected)
+                    classify_files(db, root, redo=False, doc_types=args.doc_types, keep_rejected=args.keep_rejected,
+                                   equipment_vendors=equipment_vendors(vendors_all))
             reorganize_files(db, vendors_all, root)
         if args.export:
             export_manifest(db, vendors_all, root)
             export_catalog_xlsx(db, vendors_all, root)
     except KeyboardInterrupt:
         log.warning("Interrupted - state saved; re-run the same command to resume.")
+    stale = db.query(f"SELECT COUNT(*) n FROM files WHERE COALESCE(rules_version, 0) <> {RULES_VERSION}")[0]["n"]
+    if stale and not args.classify:
+        log.warning("%d file(s) were sorted by older rules - run with --classify to re-check them", stale)
     if args.status or args.discover or args.download:
         print_status(db, chosen)
 
