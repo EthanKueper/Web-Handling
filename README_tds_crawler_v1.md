@@ -13,6 +13,10 @@ Crawls every vendor in `Vendors_With_Technical_Sheets_By_Material_Category.xlsx`
 
 The script looks for the workbook and seed file in `D:\tds_corpus\input\` (`DEFAULT_WORKBOOK` and `DEFAULT_SEEDS` near the top of the script). Override them with `--workbook PATH` and `--seeds PATH`.
 
+## Which version ran?
+
+The first log line of every run shows the build, the rules version and the full path of the script that ran, for example `tds_crawler_v1 build 2026-10-11 r8 (rules v8) - C:\...\tds_crawler_v1.py`. Browsers often save a re-downloaded file as `tds_crawler_v1 (1).py`, so check that line after replacing the script. Whenever the sorting rules change, `--classify` (or `--all`) re-checks every file automatically. A run without `--classify` warns if files were sorted by older rules.
+
 ## Install
 
 ```
@@ -74,38 +78,40 @@ Where the files go:
 - **English version found:** the English file goes in the main folder and the non-English copy in `_translations\`.
 - **No English version found:** the non-English copy still goes in `_translations\`, and the crawler moves on.
 
-A file named like a translation (`- CN`) counts as non-English unless its text is purely English. Bilingual sheets, such as a Japanese sheet with full English text, stay in the main folder.
+A file named like a translation counts as non-English unless its text is purely English. The language code can appear anywhere in the name: `X - CN`, `X_CN_200706`, `X-CHIN-0521-web`, `X D_DE_2025`, `X D_rd` vs `X E_rd`. English twins are matched with the code removed wherever it sits, so `Extruder D_DE_2025_Web.pdf` pairs with `Extruder D_EN_2025_Web.pdf`. Bilingual sheets, such as a Japanese sheet with full English text, stay in the main folder.
 
 In `tds_manifest.csv` and on the catalogue's **Translations** sheet, `english_version` names the English file, or says `NOT FOUND`. The manifest's `language` column is read from the PDF text: `en`, `zh`, `ja`, `ko`, `de`..., or `ja+en` for bilingual sheets. `--keep-translations` turns language sorting off.
 
-## Junk filtering: allowlist (keep only what proves it's technical)
+## Junk filtering: allowlist (the content has to prove it's technical)
 
-Every downloaded file must show **positive evidence** that it's a technical document, or it goes to `_rejected\`. Nothing is kept just because it didn't look like junk. Evidence is scored from the first three pages:
+Every downloaded file is read (up to the first 6 pages) and must show **real technical content**, or it goes to `_rejected\`. Nothing is kept just because it didn't look like junk, and technical-sounding words on their own aren't enough.
 
-| Evidence | Examples |
-|---|---|
-| Test methods (2 points each) | ASTM D882, ISO 527, TAPPI T410, NWSP 100.1, IPC-TM-650, DIN, JIS |
-| Property values with units | g/m², µm, mm, mil, MPa, psi, N/25 mm, °C, %, g/cm³, g/10 min, GHz, Dk/Df, W/m·K, WVTR, Gurley, oz, inch |
-| Property names (English, Chinese, Japanese, Korean, German, French) | tensile, elongation, basis weight, peel, dielectric, porosity… 拉伸, 厚度, 介电, 引張, 比誘電率, 인장… |
-| Data-sheet headings (2 points) | Technical data, Typical properties, Specification, Construction, 技术数据, 物性表 |
+**1. Rejected outright, whatever else is in the file:**
+- **Commercial or supplier paperwork** (English, German, Chinese, Japanese): invoicing, credit notes, order confirmations, purchase orders, purchasing or sales terms, delivery guidelines and addresses, Incoterms, goods receipt, supplier inquiry forms and portals, dangerous-goods shipping forms (ADR/IATA/IMDG), freight and cargo registrations, commodity-group lists, human-rights and supply-chain due-diligence statements.
+- **Corporate material:** annual, integrated or sustainability reports, management plans, balance sheets, press releases, maps.
+- **Non-technical file names:** logos, CVs, business principles, codes of conduct, policies, privacy, AGM or board papers, org charts, invitations, news, ESG, ethics, careers, PFAS, conflict minerals or GHG letters, declarations, disclosures, testimonials, success stories or case studies, invoicing, purchasing, delivery, supplier, cargo or logistics. These are also skipped at crawl time, so they're never downloaded.
 
-A file is **kept** when any of these is true:
-- it scores 4 or more;
-- its file name says it's technical (*data sheet, TDS, spec, grade, properties, selection guide, fabrication/processing guidelines, bulletin, brochure, flyer, catalogue, application note*);
-- its name contains a material word (*film, foil, laminate, paper, tape, nonwoven…*) and the text has at least some technical content;
-- it's the non-English copy of a kept English document.
+**2. Kept only with substance.** A file counts as technical when it has at least one of these:
+- a test method (ASTM, ISO, TAPPI, NWSP, IPC, DIN, JIS);
+- three or more property names (tensile, elongation, basis weight, peel, dielectric… in English, Chinese, Japanese, Korean, German or French);
+- two property names plus units or a data-sheet heading;
+- machine specifications (m/min, kg/h, kW, rpm, L/D, working width, throughput…);
+- equipment terms (extruder, flat die, spinneret, winder, slitter, coater…) together with units, specs or properties.
 
-Image-only PDFs, which have no text to check, are kept only when their name says they're technical.
+It also needs a total evidence score of 3 or more. Stray units or single words (a "%", a "mm", "temperature") don't count, and property words only match as whole words, so "temper" can't match inside "temperature".
 
-A file is **rejected** when any of these is true:
-- its name shows it isn't a technical document: logos, CVs or résumés, business principles, codes of conduct, policies, privacy, AGM or board papers, org charts, calendars, invitations, press releases, news, annual or sustainability reports, ESG, ethics, careers, PFAS, conflict minerals or GHG letters, declarations, disclosures, testimonials, success stories or case studies. These names are also skipped at crawl time, so they're never downloaded.
-- its text is corporate, in any language: reports, management plans, balance sheets, press releases, maps.
-- it has no technical evidence.
-- it's a type you don't collect (`--doc-types`).
+**Equipment makers are judged by their own standard.** For suppliers on the Equipment & Machinery or Process Technology sheets, the brochure is the technical document. So any file that names their machines or components (extruders, dies, screws, spinnerets, lines, winders…), gives machine specs, or has a technical or language-coded file name is kept, as long as it has already passed the commercial, corporate and junk-name checks. Their supplier paperwork and service flyers without product content are still rejected.
 
-The manifest's `rejected_as` column and the catalogue's **Rejected** sheet give the reason: `not technical (name)`, `corporate`, `no technical content`, `no readable text`, `sds`… For kept files, the **Evidence** column shows why each was kept, for example `12 test method(s); units: %, N/width, mm…; data-sheet heading`. Nothing is deleted. Use `--keep-rejected` to switch rejection off.
+**3. File names only help when the text can't decide.** A technical name (data sheet, TDS, spec, grade, selection guide, processing guidelines, brochure, catalogue, application note…), taken from the file name or the PDF's built-in title but never from the first line of text, keeps a file only if one of these is true:
+- the PDF is image-only or has almost no text;
+- the text also shows some technical content;
+- the text is in a language the property words don't fully cover.
 
-Pages in investor-relations, sustainability, news, press, careers and finance sections are also skipped during the crawl. Text is Unicode-normalised. PDFs whose text extracts as shifted characters (`.BSLFU`) or as character codes (`/MT78/MT101`) are decoded before checking. Garbled files whose same-named siblings are corporate count as corporate too. `--classify` re-checks any file that hasn't been scored yet, and `--reclassify` re-checks everything.
+The non-English copy of a kept English document is always kept, and filed under `_translations\`.
+
+The manifest's `rejected_as` column and the catalogue's **Rejected** sheet give the reason: `commercial`, `corporate`, `not technical (name)`, `no technical content`, `no readable text`, `sds`… For kept files, the **Evidence** column shows why each was kept, for example `12 test method(s); units: %, N/width, mm…; data-sheet heading` or `machine specs: l/d; equipment: extruder, screw`. Nothing is deleted. Use `--keep-rejected` to switch rejection off.
+
+Also handled before checking: crawl-time skipping of investor-relations, sustainability, news, press, careers and finance pages; Unicode normalisation; decoding of shifted-character (`.BSLFU`) and character-code (`/MT78`) text; and treating garbled files as corporate when their same-named siblings are. `--classify` scores any file that hasn't been checked under the current rules, and `--reclassify` re-checks everything.
 
 ## Distributors and brand filters
 
