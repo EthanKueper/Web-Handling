@@ -72,14 +72,14 @@ DEFAULT_WORKBOOK = Path(r"D:\tds_corpus\input\Vendors_With_Technical_Sheets_By_M
 DEFAULT_SEEDS = Path(r"D:\tds_corpus\input\vendor_seeds.csv")
 
 USER_AGENT_BASE = "TDSCollector/1.0 (technical datasheet research)"
-BUILD = "2026-10-11 r8"        # shown at startup - tells you which version of the script actually ran
-RULES_VERSION = 8              # bump when classification rules change: files are re-scored automatically
+BUILD = "2026-10-23 r12"        # shown at startup - tells you which version of the script actually ran
+RULES_VERSION = 11              # bump when classification rules change: files are re-scored automatically
 DEFAULT_DELAY_S = 2.0          # min seconds between requests to the same vendor
 DEFAULT_MAX_PAGES = 400        # HTML pages fetched per vendor per discovery run
 DEFAULT_MAX_DEPTH = 4
 DEFAULT_WORKERS = 4            # vendors crawled in parallel (one thread each)
 DEFAULT_MAX_PDF_MB = 50
-DEFAULT_DOC_TYPES = "tds,brochure,other"   # sds / certificate / corporate skipped
+DEFAULT_DOC_TYPES = "tds,sds,brochure,certificate,other"   # corporate skipped; SDSs kept (material safety data)
 MIN_LINK_SCORE = -2            # links scoring below this are not followed
 MAX_SITEMAP_FILES = 60
 MAX_SITEMAP_URLS = 60000
@@ -185,6 +185,13 @@ COMMERCIAL_TEXT_RE = re.compile(
     r"rechnungsstellung|gutschrift|auftragsbest[äa]tigung|einkaufsbedingungen|lieferbedingungen|"
     r"anlieferung|lieferanschrift|warengruppe|grundsatzerkl[äa]rung|sorgfaltspflicht|lieferkettengesetz|"
     r"发票|订单确认|采购条款|采购条件|請求書|注文書|購買条件)", re.I)
+# data-sheet boilerplate that names sales terms without being sales paperwork, e.g. "The quality of our
+# products is covered by the terms of the General Conditions of Sale" - removed before COMMERCIAL_TEXT_RE runs
+DISCLAIMER_RE = re.compile(
+    r"[^.\n]{0,160}\b(covered by|subject to|governed by|according to|in accordance with|refer to|see)\b"
+    r"[^.]{0,80}\b(terms and conditions|(general )?(terms|conditions) of (sale|delivery|purchase))[^.]{0,80}"
+    r"|[^.\n]{0,160}\b(unterliegt|unterliegen|gemäß|gemaess|gelten)\b[^.]{0,80}"
+    r"(verkaufs|liefer)bedingungen[^.]{0,80}", re.I)
 CORPORATE_TEXT_RE = re.compile(
     r"(integrated report|annual report|sustainability report|medium\s*-?\s*term\s+management|"
     r"long\s*-?\s*term\s+vision|management plan|balance sheet|financial results|financial statements|securities report|shareholders|"
@@ -358,6 +365,7 @@ def translation_info(url: str) -> tuple[str, str, list[str]]:
 
 
 ENGLISH_NAME_SUFFIXES = ("_english", "_en", "-en", "_EN", "-EN")
+ENGLISH_E_SUFFIX_RE = re.compile(r"(?<=[A-Z0-9])e(?:[-_]\d)?$")   # 'MHSe', 'PCR-WO3N-CSRBe-1'
 
 
 def _name_url(path: str) -> str:
@@ -388,6 +396,8 @@ def english_url_guesses(url: str) -> list[str]:
     out = list(guesses)
     for sfx in ENGLISH_NAME_SUFFIXES:
         out.append(f"{p.scheme}://{p.netloc}{folder}/{quote(base + sfx)}.pdf")
+    if re.search(r"[A-Z0-9]$", base):
+        out.append(f"{p.scheme}://{p.netloc}{folder}/{quote(base + 'e')}.pdf")   # 'MHS.pdf' -> 'MHSe.pdf'
     if base != stem:
         out.append(f"{p.scheme}://{p.netloc}{folder}/{quote(base)}.pdf")
     me = canon_url(url)
@@ -637,7 +647,7 @@ class DB:
         if "summary" not in have_files:
             c.execute("ALTER TABLE files ADD COLUMN summary TEXT")
         for col, typ in (("tech_score", "INTEGER"), ("evidence", "TEXT"), ("pdf_title", "TEXT"),
-                         ("text_chars", "INTEGER"), ("rules_version", "INTEGER")):
+                         ("text_chars", "INTEGER"), ("rules_version", "INTEGER"), ("topic", "TEXT")):
             if col not in have_files:
                 c.execute(f"ALTER TABLE files ADD COLUMN {col} {typ}")
         # pages used to be keyed by url alone, which mixed up vendors sharing a site
@@ -777,9 +787,25 @@ class Renderer:
     def __init__(self):
         from playwright.sync_api import sync_playwright  # noqa
         self._pw = sync_playwright().start()
-        exe = "/opt/pw-browsers/chromium" if Path("/opt/pw-browsers/chromium").exists() else None
-        self.browser = self._pw.chromium.launch(headless=True, **({"executable_path": exe} if exe else {}))
+        self.browser, self.name = self._launch()
         self.ctx = self.browser.new_context(user_agent=USER_AGENT_BASE)
+
+    def _launch(self):
+        """Playwright's own Chromium if it was downloaded ('playwright install chromium'); otherwise the
+        Microsoft Edge or Google Chrome already installed on this PC - so 'pip install playwright' is enough."""
+        tries = []
+        if Path("/opt/pw-browsers/chromium").exists():
+            tries.append(("Chromium", {"executable_path": "/opt/pw-browsers/chromium"}))
+        tries += [("Playwright Chromium", {}), ("Microsoft Edge", {"channel": "msedge"}),
+                  ("Google Chrome", {"channel": "chrome"})]
+        errors = []
+        for name, kw in tries:
+            try:
+                return self._pw.chromium.launch(headless=True, **kw), name
+            except Exception as e:
+                errors.append(f"{name}: {str(e).splitlines()[0][:120]}")
+        self._pw.stop()
+        raise RuntimeError("no browser could be started - " + " | ".join(errors))
 
     def html(self, url: str) -> tuple[str, str]:
         page = self.ctx.new_page()
@@ -1259,6 +1285,10 @@ def download_vendor(vendor: Vendor, db: DB, args, root: Path) -> dict:
         if row["doc_type"] not in types:
             stats["skipped_type"] += 1
             continue
+        if link_off_topic(vendor.name, row["url"], row["anchor"] or ""):
+            db.execute("UPDATE pdf_links SET state='off_topic' WHERE url=?", (row["url"],))
+            stats["skipped_off_topic"] = stats.get("skipped_off_topic", 0) + 1
+            continue
         if english_first and row["lang"]:
             foreign.append(row)
             _, key, _ = translation_info(row["url"])
@@ -1465,7 +1495,7 @@ def classify_text_doc_type(text: str, link_type: str = "", n_methods: int = 0, h
     hints = unicodedata.normalize("NFKC", hints or "")
     if link_type == "corporate" or (hints and CORPORATE_TEXT_RE.search(hints)):
         return "corporate"
-    if COMMERCIAL_TEXT_RE.search(hints or "") or COMMERCIAL_TEXT_RE.search(text[:2500]):
+    if COMMERCIAL_TEXT_RE.search(hints or "") or COMMERCIAL_TEXT_RE.search(DISCLAIMER_RE.sub(" ", text[:2500])):
         return "commercial"
     if not text.strip():
         return "unreadable"
@@ -1525,6 +1555,209 @@ def infer_from_siblings(db: DB) -> int:
     return n
 
 
+# =============================================================================
+# TOPIC SCOPE - what the corpus is about
+# =============================================================================
+# Scope comes from the "Patent Search List for Corpus Additions": a document is on-topic when it is about
+# webs (film, foil, paper, nonwovens, fabric), the processes that make them, web converting (coating,
+# laminating, adhesives, printing, cutting, labels, tapes...) or web handling equipment. Anything that relates
+# to any of these is kept, data sheet or not (SDSs included); everything else is off-topic and is deleted
+# (--keep-off-topic moves it to _rejected/ instead). Company paperwork is off-topic for every vendor.
+# Vendors whose every product document counts as on-topic:
+TOPIC_KEEP_ALL_VENDORS = {"ExxonMobil Chemical"}
+
+_TOPIC_TERMS = [
+    # webs
+    r"webs?", r"films?", r"foils?", r"papers?", r"paperboards?", r"cardboard", r"board stock", r"nonwovens?",
+    r"non[- ]wovens?", r"fabrics?", r"textiles?", r"scrims?", r"felts?", r"fleeces?", r"laminates?", r"laminat\w+",
+    r"sheet(ing)? goods", r"roll goods", r"membranes?", r"substrates?", r"facestocks?", r"liners?", r"tapes?",
+    r"labels?", r"labelstock", r"wraps?", r"pouch(es)?", r"bags?", r"sacks?", r"packaging", r"overlaminates?",
+    r"prepregs?", r"bondply", r"coverlays?", r"copper[- ]clad", r"ccl", r"strip",
+    # polymers named in the list
+    r"ldpe", r"lldpe", r"hdpe", r"mdpe", r"uhmw(-?pe)?", r"bope", r"mdo(-pe)?", r"polyethylene", r"polyolefins?",
+    r"bopp", r"cpp", r"opp", r"polypropylene", r"bopet", r"pet", r"pen", r"pbt", r"petg", r"polyester",
+    r"polyamide", r"nylon", r"bopa", r"pa ?6(,?6)?", r"pvc", r"pvdc", r"evoh", r"eva", r"polystyrene", r"hips",
+    r"polycarbonate", r"pmma", r"acrylic", r"polyimide", r"kapton", r"ptfe", r"fep", r"pfa", r"etfe", r"pvdf",
+    r"ectfe", r"fluoropolymers?", r"peek", r"pps", r"pei", r"ultem", r"psu", r"ppsu", r"tpu", r"tpe", r"tpo",
+    r"sebs", r"pvoh", r"pva", r"pla", r"pha", r"cellophane", r"cellulose", r"ionomers?", r"surlyn", r"coc",
+    r"lcp", r"elastomers?", r"epdm", r"resins?", r"polymers?", r"copolymers?", r"silicones?", r"polyurethanes?",
+    r"aluminium", r"aluminum", r"copper", r"metalli[sz]ed", r"metalli[sz]ing", r"vinyl", r"foams?",
+    # nonwoven types / end uses
+    r"carded", r"air[- ]?laid", r"wet[- ]?laid", r"dry[- ]?laid", r"spunbond(ed)?", r"melt[- ]?blown", r"spunlace",
+    r"hydroentangl\w*", r"needle[- ]?punch\w*", r"thermal(ly)? bond\w*", r"sms", r"electret", r"filter media",
+    r"filtration", r"filters?", r"geotextiles?", r"hygiene", r"wipes?", r"topsheets?", r"backsheets?",
+    r"absorbent", r"diapers?", r"sterili[sz]ation wrap", r"surgical (gowns?|drapes?)", r"masks?", r"respirators?",
+    r"wound dressings?", r"dressings?", r"battery separators?", r"separators?", r"interlinings?", r"insulation",
+    r"acoustic", r"fibers?", r"fibres?", r"bicomponent", r"viscose", r"lyocell", r"pulp",
+    # web processes
+    r"cast(ing)? film", r"casting", r"extru\w+", r"co-?extru\w+", r"tenter\w*", r"calend[ae]r\w*",
+    r"papermaking", r"paper machines?", r"blown[- ]film", r"sheet extrusion", r"orient\w+", r"biaxial\w*",
+    r"stretch\w*", r"heat[- ]set\w*", r"anneal\w*", r"rolling mill", r"rolled", r"electrodeposited", r"spinnerets?",
+    r"spinning", r"dies?", r"melt", r"granules?", r"pellets?",
+    # converting
+    r"coat(ing|ings|ed|er|ers)", r"printing", r"printable", r"print(ed|er|ers)?", r"flexo\w*", r"gravure",
+    r"offset", r"inkjet", r"digital print\w*", r"screen print\w*", r"inks?", r"primers?", r"tie[- ]layers?",
+    r"adhesives?", r"pressure[- ]sensitive", r"psa", r"hot[- ]?melts?", r"release (coatings?|liners?|films?|papers?)",
+    r"barrier", r"heat[- ]seal\w*", r"sealants?", r"anti[- ]?fog", r"slip", r"lamination", r"laminating",
+    r"laminators?", r"extrusion lamination", r"corona", r"plasma", r"flame treat\w*", r"surface treat\w*",
+    r"vacuum (coating|metalli[sz]\w+|deposition)", r"vapou?r deposition", r"sputter\w*", r"curing", r"cure",
+    r"uv", r"electron beam", r"drying", r"dryers?", r"ovens?", r"emboss\w*", r"hot stamping", r"foil stamping",
+    r"cold foil", r"transfer", r"sheeters?", r"die[- ]cut\w*", r"kiss[- ]cut\w*", r"laser cut\w*", r"perforat\w*",
+    r"punch\w*", r"slit\w*", r"rewind\w*", r"winding", r"winders?", r"unwind\w*", r"spool\w*", r"festoon\w*",
+    r"matrix strip\w*", r"trim", r"inspection", r"registration", r"static", r"ioni[sz]\w+", r"sealing",
+    r"welding", r"bag[- ]making", r"form[- ]fill[- ]seal", r"converting", r"converters?", r"bonding",
+    r"thermoform\w*", r"wrapping", r"graphics", r"wrap films?", r"window films?",
+    # web handling
+    r"web guid\w*", r"tension\w*", r"dancers?", r"accumulators?", r"splic\w+", r"idlers?", r"rollers?",
+    r"rolls", r"nip", r"spreaders?", r"chill rolls?", r"cores?", r"air shafts?", r"chucks?", r"turret",
+    r"line speed", r"web width", r"working width", r"machines?", r"lines?",
+    # other languages (Spanish, German, French, Chinese, Japanese, Korean)
+    r"pel[ií]culas?", r"l[aá]minas?", r"papel", r"no tejidos?", r"tela no tejida", r"adhesivos?",
+    r"recubrimientos?", r"laminaci[oó]n", r"etiquetas?", r"cintas?", r"impresi[oó]n", r"extrusi[oó]n",
+    r"envases?", r"embalajes?", r"folien?", r"vlies\w*", r"papier\w*", r"klebstoff\w*", r"klebeb[aä]nd\w*",
+    r"beschichtung\w*", r"kaschier\w*", r"etikett\w*", r"verpackung\w*", r"extrusion", r"films? plastiques?",
+    r"薄膜", r"箔", r"无纺布", r"不织布", r"胶粘", r"涂布", r"复合", r"包装", r"标签", r"胶带",
+    r"フィルム", r"不織布", r"粘着", r"接着", r"塗工", r"ラミネート", r"包装", r"ラベル", r"テープ", r"銅箔", r"圧延",
+    r"필름", r"부직포", r"점착", r"접착",
+]
+TOPIC_RE = re.compile(r"(?<![a-z0-9])(" + "|".join(_TOPIC_TERMS) + r")(?![a-z0-9])", re.I)
+
+# Documents about the company rather than its products - not wanted even when they name films or foils.
+# Checked against the file name, PDF title and the opening of the text only (product sheets often end
+# with "subject to our terms and conditions of sale", which must not count).
+CORPORATE_ONLY_RE = re.compile(
+    r"(integrated (sustainability )?report|annual report|sustainability report|esg (data|report)|"
+    r"financial (results|statements)|balance sheet|securities report|corporate governance|"
+    r"(medium|long)[- ]term (management plan|vision)|proxy statement|code of (business )?conduct|"
+    r"business principles|guiding principles|values and principles|human rights|modern slavery|"
+    r"privacy (policy|notice)|purchasing conditions|credit card payment|claim entry guide|"
+    r"document retrieval guide|transit damage claim|"
+    r"supplier (code|portal|registration|questionnaire|inquiry form)|cargo ?market|due diligence obligations|"
+    r"procurement report|conflict minerals|whistleblow\w*|ethics (hotline|point)|ethicspoint|carbon markets|"
+    r"co2 reduction strategy|ghg inventory|verification opinion|end user licen[cs]e|software licen[cs]e|"
+    r"curriculum vitae|notification of registration|certificate of approval|certificate number|"
+    r"attestation (statement|of conformance)|chain of custody|fsc.{0,3}coc|stakeholder|my ?mondi|"
+    r"verpflichtungserkl\w+|grundsatzerkl\w+|"
+    r"统合报告|統合報告|統合報告書|有価証券報告書|株主|决算|決算|貸借対照表|中期経営計画|長期ビジョン|"
+    r"委託生産|各\s*位|ステークホルダー|ポリシー|方針)", re.I)
+
+# Sika: industrial only (bonding, sealing, laminating, composites, automotive / marine / appliance assembly).
+# Construction product lines - including roofing and waterproofing membranes - are off-topic.
+SIKA_INDUSTRIAL_RE = re.compile(
+    r"\b(automotive|aftermarket|auto ?glass|windshields?|windscreens?|direct glazing|body ?shop|vehicles?|"
+    r"car bodies|bus(es)? and coach|truck bodies|trailers?|caravans?|recreational vehicles?|rv|"
+    r"marine (deck|vessel|industry)|boat ?building|shipbuilding|yachts?|wind (blades?|turbines?)|"
+    r"composite (parts|tooling|manufacturing|molds?)|tooling boards?|mold making|infusion|"
+    r"laminating adhesives?|flexible packaging|textile lamination|hot[- ]?melts?|pressure[- ]sensitive|"
+    r"industrial (assembly|bonding|manufacturing)|appliances?|white goods|oem|e[- ]?mobility|battery packs?|"
+    r"panel bonding|sandwich panels?)\b", re.I)
+SIKA_CONSTRUCTION_RE = re.compile(
+    r"(concrete|mortar|grout|screed|flooring|\bfloors?\b|masonry|admixture|cementitious|cement|stucco|plaster|"
+    r"\beifs\b|facade|fa[cç]ade|pavement|\bpavers?\b|basement|tunnel|bridge|parking|roofing|\broofs?\b|"
+    r"waterproofing|tiles?|tiling|anchor\w*|rebar|joint seal\w*|expansion joints?|construction|building|"
+    r"curtain wall|glazing|window|deck|sidewalk|driveway|countertop|swimming pool|hormig[oó]n|mortero|"
+    r"pavimento|lechada|techo|cubierta|impermeabiliz\w*|construcci[oó]n|azulejo|baldosa|"
+    r"sika\s*floor|sikafloor|sikacrete|sika\s*grout|sikagrout|sikatile|sika\s*tile|sarnafil|sarnacol|"
+    r"sarnafast|sikaplan|sika\s*roof|sikaroof|sikalastic|sikagard|sikatop|sika\s*top|sikarepair|"
+    r"sika\s*repair|sikaquick|sika\s*quick|sikaset|sikacem|sikaemaco|emaco|sika\s*level|sikalevel|"
+    r"sikadur|armatec|monotop|viscocrete|plastiment|sikament|sikaplast|sika\s*rapid|sikacontrol|"
+    r"sika\s*control|sika\s*air|sika\s*aer|sikafiber|sika\s*fiber|sikafume|sikapaver|separol|antisol|"
+    r"sikaswell|sikafuko|waterbar|sika\s*inject|sikamur|sikawall|sika\s*wall|sikabond|sika\s*boom|"
+    r"sikaflex\W{0,3}(1a|1 ?csl|2c|11 ?fc|15 ?lm|pro|construction|crack|concrete|mortar|self[- ]?level|"
+    r"multi|textured|window|joint)|sikasil\W{0,3}(sg|ig|wt|ws|wr|c|gs|n)|parex|lahabra|la habra|merkrete|"
+    r"senergy|sch[oö]nox|kingpak|king[- ]ms|king[- ]rs|\bbmi\b|everbuild|rmax|thermasheath|ecomaxci|emseal|"
+    r"thorolastic|thoro|masterseal|mastertop|masterprotect|masteremaco|mbrace|ucrete|purcem|epocem|"
+    r"thermabase|nailable base|water main|rut-mix|merlex|variance specialty)", re.I)
+
+SIKA_INDUSTRIAL_LINE_RE = re.compile(
+    r"(sika\W{0,2}force|sika\W{0,2}power|sika\W{0,2}melt|sikafast|sika\W{0,2}fast\W{0,3}\d|sika\W{0,2}tack|"
+    r"biresin|sika\W{0,2}sense|sika\W{0,2}reinforcer|sika\W{0,2}baffle|sika\W{0,2}damp|sika\W{0,2}aktivator|"
+    r"sika\W{0,2}activator|sika\W{0,2}transfer|sika\W{0,2}block|advanced resins|sikaflex\W{0,3}[25]\d\d|"
+    r"sikaflex\W{0,3}(ws|p2g)|sikasil\W{0,3}[67]\d\d|primer\W{0,3}2\d\d|sika\W{0,2}handclean)", re.I)
+SIKA_CONSTRUCTION_LINE_RE = re.compile(
+    r"(sika\s*floor|sikafloor|sikacrete|sika\s*grout|sikagrout|sikatile|sika\s*tile|sarnacol|sarnafast|"
+    r"sika\s*roof\s*fastener|sikalastic|sikagard|sikatop|sika\s*top|sikarepair|sika\s*repair|sikaquick|"
+    r"sika\s*quick|sikaset|sikacem|sikaemaco|emaco|sika\s*level|sikalevel|sikadur|armatec|monotop|viscocrete|"
+    r"plastiment|sikament|sikaplast|sika\s*rapid|sikacontrol|sika\s*control|sika\s*air\b|sika\s*aer|sikafiber|"
+    r"sika\s*fiber|sikafume|sikapaver|separol|antisol|sikaswell|sikafuko|waterbar|sika\s*inject|sikamur|"
+    r"sikawall|sika\s*wall|sikabond|sika\s*boom|sikaflex\W{0,3}(1a|1 ?csl|2c|11 ?fc|15 ?lm|pro\b|construction|"
+    r"crack|concrete|mortar|self[- ]?level|multi|textured|window|joint)|sikasil\W{0,3}(sg|ig|wt|ws|wr|c\b|gs|n\b)|"
+    r"parex|lahabra|la habra|merkrete|senergy|sch[oö]nox|kingpak|king[- ]ms|king[- ]rs|\bbmi\b|everbuild|"
+    r"rmax|thermasheath|ecomaxci|emseal|thorolastic|thoro|masterseal|mastertop|masterprotect|masteremaco|"
+    r"mbrace|ucrete|purcem|epocem|thermabase|nailable base|water main|rut-mix|merlex|variance specialty|"
+    r"sarnafil|sarna\w+|sikaplan|sika\s*trocal|sikaproof|sika\s*roof|sikaroof|sikashield|sikawrap|carbodur|"
+    r"sikagrind|sika\s*one\s*shot|loadflex|pebbletex|lithochrome|pulastic|dritac|drylok|sikaflow|ferrogard|"
+    r"fibercast|hydrotite|sikacor|sikaseal|sika\s*film|sika\s*fleece|reemat|sikaflex\W{0,3}[79]\d\d|"
+    r"sikaflex\W{0,3}1c|ultra-?max|onedek|rhinobond|retrodriller|\b(ms|rs|hc|fa|hp|c3)-[a-z]?\d)", re.I)
+
+# sales paperwork: only when the document IS one (file name or its very first line), because product
+# sheets often carry "see our terms and conditions" in a header or footer
+PAPERWORK_TITLE_RE = re.compile(
+    r"(terms (and|&) conditions|terms of (use|sale)|general (terms|conditions) of (purchase|sale|delivery)|"
+    r"purchase orders?|invoic(e|es|ing)|order confirmations?)", re.I)
+
+# plant / quality-system certificates, judged by file name only (data sheets often say "ISO 9001 certified")
+CERT_NAME_RE = re.compile(r"(?<![a-z0-9])(as|iso|iatf)[\s_-]?(9100|9001|14001|45001|50001|16949)(?![0-9])", re.I)
+
+# Avery Dennison medical: liquids and creams are not webs (dressings, tapes and films are)
+AVERY_NOT_WEB_RE = re.compile(r"(barrier film spray|\bspray\b|barrier cream|\bcream\b|\bswab\b|lotion|ointment)", re.I)
+
+
+def topic_hits(text: str) -> int:
+    """Number of distinct on-topic terms in the text."""
+    return len({m.group(0).lower() for m in TOPIC_RE.finditer(text or "")})
+
+
+def topic_decision(vendor: str, name: str, text: str, keep_all_vendors: set | None = None) -> str | None:
+    """None = on-topic (keep). Otherwise a short reason the file is off-topic.
+    vendor: vendor name; name: file stem + PDF title; text: first pages of extracted text."""
+    t = (text or "")[:15000]
+    head = f"{name} {t[:1500]}"
+    first_line = next((ln for ln in t.splitlines() if ln.strip()), "")[:120]
+    if CORPORATE_ONLY_RE.search(f"{name} {t[:400]}") or CERT_NAME_RE.search(name) or \
+            PAPERWORK_TITLE_RE.search(f"{name} {first_line}") or \
+            re.search(r"noti\s*fi\s*cati\s*on of regi\s*strati\s*on", t[:400], re.I):
+        return "off-topic (corporate)"
+    if keep_all_vendors and vendor in keep_all_vendors:
+        return None
+    v = (vendor or "").lower()
+    if v.startswith("sika"):
+        # Industrial Sika only (laminating / hot-melt / PSA / bonding and sealing for vehicles, marine,
+        # appliances, composites). Construction - including roofing and waterproofing membranes - is out.
+        title = f"{name} {t[:300]}"
+        if SIKA_INDUSTRIAL_LINE_RE.search(title):
+            return None                                   # SikaForce, SikaMelt, Sikaflex-2xx ... by name
+        if SIKA_CONSTRUCTION_LINE_RE.search(title):
+            return "off-topic (construction)"             # Sikafloor, Sikacrete, Sarnafil, Parex ... by name
+        ind = {m.group(0).lower() for m in SIKA_INDUSTRIAL_RE.finditer(t[:6000] + " " + name)}
+        con = len(SIKA_CONSTRUCTION_RE.findall(head))
+        if ind and (len(ind) >= 2 or con == 0):
+            return None
+        return "off-topic (construction)" if con else "off-topic"
+    if v.startswith("avery") and AVERY_NOT_WEB_RE.search(name) and not re.search(
+            r"(dressing|tape|film(?! spray)|foam|nonwoven|label)", name, re.I):
+        return "off-topic (not a web product)"
+    # every other vendor in the workbook supplies webs, web materials or web machinery: their product
+    # documents relate to the topics even when the wording is terse ("EM-370Z LAM") or not in English
+    return None
+
+
+def link_off_topic(vendor: str, url: str, anchor: str = "") -> bool:
+    """Before download: skip links whose file name / link text alone shows they are off-topic
+    (company paperwork, plant certificates, Sika construction product lines). Anything unclear is
+    downloaded and judged on its content."""
+    name = f"{Path(unquote(urlparse(url).path)).stem} {anchor}"
+    if CORPORATE_ONLY_RE.search(name) or CERT_NAME_RE.search(name) or PAPERWORK_TITLE_RE.search(name):
+        return True
+    v = (vendor or "").lower()
+    if v.startswith("sika"):
+        return bool(SIKA_CONSTRUCTION_LINE_RE.search(name)) and not SIKA_INDUSTRIAL_LINE_RE.search(name)
+    if v.startswith("avery"):
+        return bool(AVERY_NOT_WEB_RE.search(name)) and not re.search(
+            r"(dressing|tape|film(?! spray)|foam|nonwoven|label)", name, re.I)
+    return False
+
+
 # ---- Allowlist: a file is kept only with positive evidence of technical content ----------------
 UNIT_PATTERNS = {
     "g/m²": r"\bg\s*/\s*m\s*[²2]|\bgsm\b|\bg/sq\.?\s*m",
@@ -1554,12 +1787,15 @@ PROPERTY_RE = re.compile(
     r"bulk density|filtration efficiency|pressure drop|penetration|surface resistance|\btack\b|"
     r"shear|release force|coat weight|roughness|annealing|\btemper(s|ed)?\b|purity|roll length|construction|resin content|"
     r"glass style|copper weight|prepreg|laminate|\bply\b|compression|durometer|cell size|fib(er|re)|"
+    r"softening point|melting (point|temperature)|\bvicat\b|deflection temperature|\bhdt\b|glass transition|"
+    r"crystallization|\bcolou?r\b|yellowness|specific gravity|flash point|molecular weight|mooney|\bash\b|"
+    r"volatiles?|comonomer|izod|charpy|flexural|dart (impact|drop)|secant|melt strength|\bmfr\b|\bmfi\b|"
     r"拉伸|伸长|厚度|密度|介电|损耗|导热|热导|剥离|强度|硬度|性能|物性|测试方法|试验方法|典型值|规格|規格|特性|"
     r"引張|伸び|厚さ|比誘電率|誘電正接|熱伝導|はく離|剥離|強度|硬さ|代表値|인장|두께|밀도|유전|강도|물성|"
     r"zugfestigkeit|dicke|dichte|dehnung|flächengewicht|épaisseur|densité|allongement)", re.I)
 HEADER_RE = re.compile(
     r"(technical data|data sheet|datasheet|typical (values|properties)|product data|material properties|"
-    r"test method|physical properties|mechanical properties|electrical properties|thermal properties|"
+    r"test method|test based on|typical value|physical properties|mechanical properties|electrical properties|thermal properties|"
     r"grade\s+thickness|technische daten|技术数据|技術データ|数据表|データシート|物性表|典型值|代表値|"
     r"technisches datenblatt|fiche technique)", re.I)
 _B, _E = r"(?:^|[\W_])", r"(?:$|[\W_])"
@@ -1578,7 +1814,7 @@ NAME_JUNK_RE = re.compile(_B + r"(logos?|curriculum|cv|resume|vcard|business[\s_
                           r"agm|general[\s_-]*meeting|board[\s_-]*of[\s_-]*directors|remuneration|nomination|"
                           r"articles[\s_-]*of[\s_-]*association|org(ani[sz]ation(al)?)?[\s_-]*chart|calendar|"
                           r"invitation|agenda|press[\s_-]*releases?|news|annual[\s_-]*report|sustainab\w*|esg|"
-                          r"ethics|hotline|careers?|jobs?|pfas|conflict[\s_-]*minerals|ghg|greenhouse|"
+                          r"ethics|hotline|careers?|jobs?|pfas|conflict[\s_-]*minerals|ghg|greenhouse|lca|life[\s_-]*cycle[\s_-]*(assessment|analysis)|"
                           r"verification[\s_-]*opinion|letter|declaration|disclosure|testimonials?|"
                           r"success[\s_-]*stor(y|ies)|case[\s_-]*stud(y|ies)|environmental[\s_-]*(bulletin|statement|compliance)|"
                           r"invoic\w*|order[\s_-]*confirmations?|purchas\w*|delivery[\s_-]*(guidelines|conditions|"
@@ -1599,6 +1835,7 @@ EQUIP_RE = re.compile(
     r"extruder|schnecke|zylinder|düse|duese|wickler|kaschier|beschicht|"
     r"挤出机|螺杆|模头|喷丝板|收卷|分切|涂布|复合机|流延|吹膜)", re.I)
 MIN_TECH_SCORE = 3
+STRONG_TECH_SCORE = 15      # this much evidence = a real data sheet, even if its small print names sales terms
 LOW_TEXT_CHARS = 400        # less text than this = mostly images; the name may decide
 
 
@@ -1623,6 +1860,7 @@ def technical_evidence(text: str) -> tuple[int, str]:
     # substance: real data, not just a stray unit or a technical-sounding word
     substantive = (bool(methods) or len(props) >= 3 or (len(props) >= 2 and (units or head))
                    or len(machine) >= 2 or (len(props) >= 1 and len(units) >= 2)
+                   or (head and len(props) >= 1 and bool(units))            # short sheet: heading + a value table
                    or (len(equip) >= 3 and (units or machine or props)))   # machine / component product docs
     if not substantive:
         score = min(score, MIN_TECH_SCORE - 1)
@@ -1643,15 +1881,24 @@ def technical_evidence(text: str) -> tuple[int, str]:
 
 
 def decide_keep(f, doc_types: set, equipment_vendor: bool = False) -> str | None:
-    """None = keep, otherwise the reason it is rejected. The CONTENT decides; a technical file name only
-    helps when the PDF has (almost) no text to judge. f needs path, pdf_title, text_doc_type, tech_score,
-    text_chars, language, english_path."""
+    """None = keep, otherwise the reason it is rejected. The TOPIC decides first: anything that relates to
+    the corpus topics is kept (data sheet, SDS, brochure, bulletin...), anything off-topic is rejected.
+    Files whose topic could not be judged (PDF unreadable) fall back to the technical-evidence rules below,
+    where a technical file name only helps when the PDF has (almost) no text. f needs path, pdf_title,
+    text_doc_type, tech_score, text_chars, language, english_path, topic."""
+    topic = f["topic"]
+    if topic == "on":
+        return None
+    if topic:
+        return topic                                    # "off-topic", "off-topic (construction)" ...
     dtype = f["text_doc_type"] or "other"
     score = f["tech_score"] or 0
     stem = Path(f["path"]).stem
     names = f"{stem} {f['pdf_title'] or ''}"
     if NAME_JUNK_RE.search(stem) and score < 8:
         return "not technical (name)"
+    if dtype == "commercial" and score >= STRONG_TECH_SCORE:
+        dtype = "tds"          # a full property table outweighs one sales phrase in the small print
     if dtype in ("corporate", "commercial"):
         return dtype
     if dtype not in doc_types and dtype != "unreadable":
@@ -1710,13 +1957,48 @@ def reject_unwanted(db: DB, doc_types: list[str], equipment_vendors: set | None 
     wanted = set(doc_types)
     n = 0
     for f in db.query("SELECT sha256, path, title, pdf_title, text_doc_type, tech_score, text_chars, language, "
-                      "english_path, rejected, evidence, vendor FROM files WHERE text_doc_type IS NOT NULL"):
+                      "english_path, rejected, evidence, vendor, topic FROM files WHERE text_doc_type IS NOT NULL"):
         reason = decide_keep(f, wanted, equipment_vendor=f["vendor"] in (equipment_vendors or set()))
         if (f["rejected"] or None) != reason:
             db.execute("UPDATE files SET rejected=? WHERE sha256=?", (reason, f["sha256"]))
             n += 1 if reason else 0
     if n:
-        log.info("Rejected %d file(s) without technical evidence or with junk content (moved to _rejected/)", n)
+        log.info("Rejected %d file(s) that are off-topic or have no usable content", n)
+    return n
+
+
+def delete_off_topic(db: DB, root: Path) -> int:
+    """Delete files judged off-topic and remember their links as deleted, so they are never downloaded
+    again. Each deletion is logged to logs/deleted_off_topic_YYYYMMDD.csv with its source URL."""
+    rows = db.query("SELECT sha256, path, vendor, first_url, topic FROM files WHERE topic LIKE 'off-topic%'")
+    if not rows:
+        return 0
+    if not (root / "pdfs").exists():
+        log.warning("pdfs/ folder not found - is the drive connected? Nothing was deleted.")
+        return 0
+    out = root / "logs" / f"deleted_off_topic_{datetime.now():%Y%m%d}.csv"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    new = not out.exists()
+    n = 0
+    with open(out, "a", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        if new:
+            w.writerow(["deleted_at", "vendor", "reason", "path", "source_url", "sha256"])
+        for r in rows:
+            p = root / r["path"]
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError as e:
+                log.warning("Could not delete %s: %s", p, e)
+                continue
+            db.execute("UPDATE pdf_links SET state='deleted' WHERE sha256=?", (r["sha256"],))
+            db.execute("DELETE FROM files WHERE sha256=?", (r["sha256"],))
+            db.execute("UPDATE files SET english_path=NULL WHERE english_path=?", (r["path"],))
+            w.writerow([utcnow(), r["vendor"], r["topic"], r["path"], r["first_url"], r["sha256"]])
+            n += 1
+    log.info("Deleted %d off-topic file(s) - listed in %s (use --keep-off-topic to keep them in _rejected/)",
+             n, out.name)
     return n
 
 
@@ -1739,7 +2021,12 @@ def pair_translations_by_text(db: DB) -> int:
     english: dict = {}
     for f in files:
         if _is_english(f["language"] or "") and not name_lang(f["path"]):
-            english.setdefault((f["vendor"], match_key(Path(f["path"]).stem)), f)
+            stem = COLLISION_SUFFIX_RE.sub("", Path(f["path"]).stem)
+            english.setdefault((f["vendor"], match_key(stem)), f)
+            # 'RNK_Ce.pdf' / 'MHSe.pdf' = English copy of 'RNK-C.pdf' / 'MHS.pdf' (lower-case e after a code)
+            m = ENGLISH_E_SUFFIX_RE.search(stem)
+            if m:
+                english.setdefault((f["vendor"], match_key(stem[:m.start()])), f)
     for f in files:
         if f["english_path"] or not _file_is_foreign(f):
             continue
@@ -1800,20 +2087,30 @@ def unshift_text(text: str) -> str:
     more English words, use the shifted-back text."""
     if not text or re.search(r"\b(the|and|of|for|with)\b", text[:3000], re.I):
         return text
+    # real German / French / Spanish / Italian / Dutch text has no English words but is NOT shifted
+    if re.search(r"\b(der|die|und|ist|mit|von|f[üu]r|eine?|les?|la|des|et|est|pour|el|los|las|y|con|para|"
+                 r"il|di|che|per|het|een|van|voor)\b", text[:3000], re.I):
+        return text
     sample = re.sub(r"\s", "", text[:4000])
     if not sample or sum(1 for c in sample if ord(c) < 128) < 0.95 * len(sample):
         return text  # CJK / accented text - shifted-font garbage is plain ASCII
+    letters = [c for c in sample if c.isalpha()]
+    lower_share = sum(c.islower() for c in letters) / max(1, len(letters))
 
     def hits(t: str) -> int:
         return sum(1 for w in re.findall(r"[a-z]+", t[:4000].lower()) if w in ENGLISH_STOPWORDS)
 
     base, best, best_txt = hits(text), 0, text
     for k in (29, 31, 3, 1):
+        # a 29/31 shift turns lowercase letters into capitals and punctuation, so genuine garbage of that
+        # kind has almost no lowercase letters - normal text in any Latin language is mostly lowercase
+        if k in (29, 31) and lower_share > 0.3:
+            continue
         cand = "".join(chr(ord(c) + k) if 33 <= ord(c) <= 126 - k else c for c in text)
         h = hits(cand)
         if h > best:
             best, best_txt = h, cand
-    return best_txt if best >= 3 and best > 2 * base else text
+    return best_txt if best >= 5 and best > 3 * base else text
 
 
 SUMMARY_SKIP_RE = re.compile(
@@ -1850,7 +2147,7 @@ def make_summary(text: str, filename: str) -> str:
 
 
 def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_rejected: bool = False,
-                   equipment_vendors: set | None = None) -> int:
+                   equipment_vendors: set | None = None, keep_off_topic: bool = False) -> int:
     try:
         from pypdf import PdfReader
     except ImportError:
@@ -1862,18 +2159,20 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
         log.info("Text extraction: pypdf %s", getattr(pypdf, "__version__", "?"))
     except Exception:
         pass
-    rows = db.query("SELECT f.sha256, f.path, l.doc_type AS link_type FROM files f "
+    rows = db.query("SELECT f.sha256, f.path, f.vendor, l.doc_type AS link_type FROM files f "
                     "LEFT JOIN pdf_links l ON l.url = f.first_url" +
                     ("" if redo else " WHERE f.classified_at IS NULL OR f.language IS NULL OR f.summary IS NULL"
                                     " OR f.tech_score IS NULL OR f.text_chars IS NULL"
                                     f" OR COALESCE(f.rules_version, 0) <> {RULES_VERSION}"))
     n = 0
+    unread: list[str] = []
     for row in rows:
         if STOP.is_set():
             break
         p = root / row["path"]
         title, pages, text = "", None, ""
         rd = None
+        read_ok = True
         try:
             rd = PdfReader(str(p))
             pages = len(rd.pages)
@@ -1885,6 +2184,8 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
             title = (meta_title if len(meta_title.strip()) > 3 else first_line)[:200]
         except Exception as e:
             log.debug("classify %s: %s", p, e)
+            read_ok = False
+            unread.append(str(e))
         methods, fams = extract_methods(text)
         meta_t = ""
         try:
@@ -1896,17 +2197,30 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
         lang = detect_language(text)
         summary = make_summary(text, row["path"])
         tscore, evid = technical_evidence(text)
+        # topic: "on", an off-topic reason, or NULL when the PDF could not be opened (never delete what we
+        # could not read - e.g. encrypted PDFs need the 'cryptography' package)
+        topic = None
+        if read_ok:
+            topic = topic_decision(row["vendor"], f"{Path(row['path']).stem} {meta_t}",
+                                   unicodedata.normalize("NFKC", text), TOPIC_KEEP_ALL_VENDORS) or "on"
         db.execute("UPDATE files SET pages=?, title=?, text_doc_type=?, test_methods=?, method_families=?, "
                    "language=?, summary=?, tech_score=?, evidence=?, pdf_title=?, text_chars=?, rules_version=?, "
-                   "classified_at=? WHERE sha256=?",
+                   "topic=?, classified_at=? WHERE sha256=?",
                    (pages, title, dtype, "; ".join(methods), "; ".join(fams), lang, summary, tscore, evid,
-                    meta_t[:200], len(re.sub(r"\s", "", text)), RULES_VERSION, utcnow(), row["sha256"]))
+                    meta_t[:200], len(re.sub(r"\s", "", text)), RULES_VERSION, topic, utcnow(), row["sha256"]))
         n += 1
     log.info("Classified %d file(s)", n)
+    if unread:
+        crypto = sum("cryptography" in e for e in unread)
+        log.warning("%d PDF(s) could not be read%s - their topic is unknown, so they were not deleted",
+                    len(unread), f" ({crypto} encrypted: run \"{sys.executable}\" -m pip install cryptography, "
+                    "then --classify again)" if crypto else "")
     infer_from_siblings(db)
     pair_translations_by_text(db)
     if doc_types is not None and not keep_rejected:
         reject_unwanted(db, doc_types, equipment_vendors)
+        if not keep_off_topic:
+            delete_off_topic(db, root)
     total, with_en = mark_non_english(db)
     if total:
         log.info("Non-English documents: %d (all in _translations/) - %d with an English version in the main "
@@ -2181,7 +2495,10 @@ def parse_args(argv=None):
                     help="re-check downloaded PDFs with ETag/If-Modified-Since to catch revised sheets")
     ap.add_argument("--reclassify", action="store_true", help="re-run classification on all files")
     ap.add_argument("--keep-rejected", action="store_true",
-                    help="don't move files whose text shows an unwanted type (corporate, SDS...) to _rejected/")
+                    help="turn off sorting: don't reject or delete anything (off-topic, corporate...)")
+    ap.add_argument("--keep-off-topic", action="store_true",
+                    help="don't delete off-topic files (outside the web / film / foil / paper / nonwoven / converting "
+                         "scope); move them to _rejected/ instead")
     ap.add_argument("--keep-translations", action="store_true",
                     help="turn off language sorting: keep non-English documents in the main folder and don't hunt for "
                          "English versions")
@@ -2271,7 +2588,18 @@ def main(argv=None):
                 try:
                     import playwright  # noqa
                 except ImportError:
-                    log.warning("--js requested but playwright not installed (pip install playwright)")
+                    log.warning("--js requested but Playwright is not installed for this Python (%s). Run: "
+                                "\"%s\" -m pip install playwright  - continuing without JavaScript rendering",
+                                sys.executable, sys.executable)
+                    args.js = False
+            if args.js:
+                try:
+                    r = Renderer()
+                    log.info("JavaScript rendering: using %s", r.name)
+                    r.close()
+                except Exception as e:
+                    log.warning("--js: %s. Install Microsoft Edge or Google Chrome, or run \"%s\" -m playwright "
+                                "install chromium - continuing without JavaScript rendering", e, sys.executable)
                     args.js = False
             run_parallel(lambda v: VendorCrawler(v, db, args).run(), active, args.workers)
         if args.download and not STOP.is_set():
@@ -2287,14 +2615,15 @@ def main(argv=None):
         if args.classify and not STOP.is_set():
             backfill_link_lang(db)
             classify_files(db, root, redo=args.reclassify, doc_types=args.doc_types, keep_rejected=args.keep_rejected,
-                           equipment_vendors=equipment_vendors(vendors_all))
+                           equipment_vendors=equipment_vendors(vendors_all), keep_off_topic=args.keep_off_topic)
             if args.download and not args.keep_translations and not STOP.is_set():
                 more = queue_english_guesses(db, vendors_all, only={v.name for v in chosen})
                 if more:
                     log.info("Looking for English versions of non-English documents (%d vendor(s))", len(more))
                     run_parallel(lambda v: download_vendor(v, db, args, root), more, args.workers)
                     classify_files(db, root, redo=False, doc_types=args.doc_types, keep_rejected=args.keep_rejected,
-                                   equipment_vendors=equipment_vendors(vendors_all))
+                                   equipment_vendors=equipment_vendors(vendors_all),
+                                   keep_off_topic=args.keep_off_topic)
             reorganize_files(db, vendors_all, root)
         if args.export:
             export_manifest(db, vendors_all, root)
