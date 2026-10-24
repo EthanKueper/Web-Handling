@@ -72,8 +72,10 @@ DEFAULT_WORKBOOK = Path(r"D:\tds_corpus\input\Vendors_With_Technical_Sheets_By_M
 DEFAULT_SEEDS = Path(r"D:\tds_corpus\input\vendor_seeds.csv")
 
 USER_AGENT_BASE = "TDSCollector/1.0 (technical datasheet research)"
-BUILD = "2026-10-23 r12"        # shown at startup - tells you which version of the script actually ran
-RULES_VERSION = 11              # bump when classification rules change: files are re-scored automatically
+BUILD = "2026-10-24 r14"        # shown at startup - tells you which version of the script actually ran
+RULES_VERSION = 12              # bump when classification rules change: files are re-scored automatically
+                                # (r14 paperwork rules were applied to the corpus by the 2026-10-24 audit, so
+                                #  no bump - they apply to new downloads; bump to re-check every file)
 DEFAULT_DELAY_S = 2.0          # min seconds between requests to the same vendor
 DEFAULT_MAX_PAGES = 400        # HTML pages fetched per vendor per discovery run
 DEFAULT_MAX_DEPTH = 4
@@ -91,6 +93,17 @@ MAX_RETRIES = 2
 LOCALE_ALLOW = {"en", "en-us", "en-gb", "en_us", "en_gb", "us", "global", "int",
                 "ww", "english", "en-global", "en-int", "gb", "uk", "na"}
 LOCALE_RE = re.compile(r"^[a-z]{2}([-_][a-z]{2})?$")
+# only real language / country codes count as a locale folder ('/jm/' on jm.com is a brand folder, not a language)
+LOCALE_CODES = {"ar", "bg", "ca", "cs", "da", "de", "el", "es", "et", "fa", "fi", "fr", "he", "hi", "hr", "hu", "id",
+                "is", "it", "ja", "ko", "lt", "lv", "ms", "nl", "no", "pl", "pt", "ro", "ru", "sk", "sl", "sr", "sv",
+                "th", "tr", "uk", "vi", "zh", "cn", "jp", "kr", "tw", "br", "mx", "cz", "se", "dk", "gr", "at", "ch",
+                "be", "ar", "cl", "co", "pe", "ve", "ua", "il", "sa", "ae", "eg", "in", "my", "sg", "ph", "au", "nz",
+                "ca", "za", "es", "fr", "de", "it", "nl", "pl", "pt", "ru", "us", "gb", "en"}
+
+
+def is_locale(seg: str) -> bool:
+    seg = seg.lower()
+    return bool(LOCALE_RE.match(seg)) and seg[:2] in LOCALE_CODES
 
 SKIP_EXT = {
     ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".bmp", ".ico", ".tif", ".tiff",
@@ -344,7 +357,7 @@ def translation_info(url: str) -> tuple[str, str, list[str]]:
         if m:
             lang, base = LANG_WORDS[m.group("word").lower()], m.group("base")
     segs = p.path.split("/")
-    loc_idx = next((i for i, sg in enumerate(segs[:5]) if LOCALE_RE.match(sg.lower())
+    loc_idx = next((i for i, sg in enumerate(segs[:5]) if is_locale(sg)
                     and sg.lower()[:2] != "en" and sg.lower() not in LOCALE_ALLOW), None)
     if not lang and loc_idx is not None:
         lang, base = segs[loc_idx].lower()[:2], stem
@@ -412,11 +425,19 @@ OTHER_STOPWORDS = {
     "es": {"y", "los", "las", "para", "con", "es", "una", "del", "por", "como", "más", "son"},
     "it": {"e", "il", "della", "per", "con", "sono", "una", "delle", "degli", "nel", "che", "alla"},
     "pt": {"e", "os", "as", "para", "com", "uma", "dos", "das", "não", "são", "pelo", "pela"},
+    "nl": {"een", "het", "van", "voor", "zijn", "met", "niet", "wordt", "deze", "ook", "bij", "naar"},
+    "sv": {"och", "att", "för", "av", "på", "är", "med", "som", "till", "eller", "inte", "vid"},
+    "pl": {"jest", "się", "nie", "oraz", "dla", "przez", "lub", "jak", "który", "które", "przy", "jako"},
+    "tr": {"ve", "bir", "için", "ile", "bu", "olarak", "veya", "daha", "çok", "gibi", "olan", "değil"},
+    "fi": {"ja", "on", "tai", "kanssa", "jos", "että", "ei", "tämä", "joka", "ovat", "kun", "sekä"},
+    "ro": {"și", "în", "cu", "pentru", "sau", "este", "nu", "din", "care", "mai", "fi", "sunt"},
+    "hu": {"és", "az", "egy", "hogy", "nem", "vagy", "csak", "meg", "ezt", "kell", "ha", "mint"},
+    "ms": {"dan", "yang", "untuk", "dengan", "ini", "atau", "pada", "dalam", "tidak", "boleh", "adalah", "jika"},
 }
 
 
 def detect_language(text: str) -> str:
-    """Rough language of PDF text: en, zh, ja, ko, ru, de, fr, es, it, pt, '<xx>+en' (bilingual) or ''."""
+    """Rough language of PDF text: en, zh, ja, ko, ru, de, fr, es, it, pt, nl, sv, pl, tr, fi, ro, hu, ms, '<xx>+en' (bilingual) or ''."""
     if len(text.strip()) < 40:
         return ""
     words = re.findall(r"[A-Za-zÀ-ÿ]+", text.lower())
@@ -444,7 +465,7 @@ def locale_blocked(url: str, vendor_prefix_locales: set[str]) -> bool:
     if not segs:
         return False
     first = segs[0]
-    return bool(LOCALE_RE.match(first)) and first not in LOCALE_ALLOW and first not in vendor_prefix_locales
+    return is_locale(first) and first not in LOCALE_ALLOW and first not in vendor_prefix_locales
 
 
 # =============================================================================
@@ -466,6 +487,8 @@ class Vendor:
     path_prefixes: list[str] = field(default_factory=list)
     render_js: bool = False
     notes: str = ""
+    scope_keep: object = None                                   # seeds.csv "scope_keep": compiled regex or None
+    scope_exclude: object = None                                # seeds.csv "scope_exclude": compiled regex or None
 
     @property
     def slug(self) -> str:
@@ -536,7 +559,7 @@ def load_workbook_vendors(path: Path) -> dict[str, Vendor]:
 
 
 SEED_FIELDS = ["vendor", "status", "domains", "start_urls", "path_prefixes", "render_js", "folder",
-               "pdf_filter", "notes"]
+               "pdf_filter", "scope_keep", "scope_exclude", "notes"]
 
 
 def merge_seeds(vendors: dict[str, Vendor], seeds_path: Path) -> None:
@@ -568,6 +591,13 @@ def merge_seeds(vendors: dict[str, Vendor], seeds_path: Path) -> None:
                 v.pdf_filter, v.pdf_filter_domain = re.compile(rx, re.I), dom
             except re.error as e:
                 log.error("Bad pdf_filter regex for %s: %s", v.name, e)
+        for col in ("scope_keep", "scope_exclude"):
+            rx = (row.get(col) or "").strip()
+            if rx:
+                try:
+                    setattr(v, col, re.compile(rx, re.I))
+                except re.error as e:
+                    log.error("Bad %s regex for %s: %s", col, v.name, e)
         if v.status != "skip" and not v.domains and v.start_urls:
             v.domains = sorted({host_of(u).removeprefix("www.") for u in v.start_urls})
     missing = [v for k, v in vendors.items() if k not in seen]
@@ -872,7 +902,7 @@ class VendorCrawler:
         self.prefix_locales = set()
         for u in vendor.start_urls + vendor.path_prefixes:
             segs = [s for s in urlparse(u if "://" in u else "http://x" + u).path.lower().split("/") if s]
-            if segs and LOCALE_RE.match(segs[0]):
+            if segs and is_locale(segs[0]):
                 self.prefix_locales.add(segs[0])
 
     # ---- scope -------------------------------------------------------------
@@ -1285,7 +1315,8 @@ def download_vendor(vendor: Vendor, db: DB, args, root: Path) -> dict:
         if row["doc_type"] not in types:
             stats["skipped_type"] += 1
             continue
-        if link_off_topic(vendor.name, row["url"], row["anchor"] or ""):
+        if link_off_topic(vendor.name, row["url"], row["anchor"] or "", (vendor.scope_keep, vendor.scope_exclude),
+                          row["found_on"] or ""):
             db.execute("UPDATE pdf_links SET state='off_topic' WHERE url=?", (row["url"],))
             stats["skipped_off_topic"] = stats.get("skipped_off_topic", 0) + 1
             continue
@@ -1351,6 +1382,10 @@ def download_vendor(vendor: Vendor, db: DB, args, root: Path) -> dict:
 
 def backfill_link_lang(db: DB) -> None:
     """Links recorded before translation handling existed get their language tag filled in."""
+    # tags from folders that only looked like a locale (e.g. '/jm/' on jm.com) are re-derived
+    for r in db.query("SELECT DISTINCT lang FROM pdf_links WHERE lang IS NOT NULL AND lang <> ''"):
+        if r["lang"] not in LANG_CODES.values() and r["lang"] not in LOCALE_CODES and r["lang"] not in LANG_WORDS.values():
+            db.execute("UPDATE pdf_links SET lang=NULL WHERE lang=?", (r["lang"],))
     rows = db.query("SELECT url FROM pdf_links WHERE lang IS NULL")
     if rows:
         db.executemany("UPDATE pdf_links SET lang=? WHERE url=?", [(translation_info(r["url"])[0], r["url"]) for r in rows])
@@ -1632,7 +1667,7 @@ CORPORATE_ONLY_RE = re.compile(
     r"business principles|guiding principles|values and principles|human rights|modern slavery|"
     r"privacy (policy|notice)|purchasing conditions|credit card payment|claim entry guide|"
     r"document retrieval guide|transit damage claim|"
-    r"supplier (code|portal|registration|questionnaire|inquiry form)|cargo ?market|due diligence obligations|"
+    r"supplier (code|portal|registration|questionnaire|inquiry form|quality (requirements|manual))|cargo ?market|due diligence obligations|"
     r"procurement report|conflict minerals|whistleblow\w*|ethics (hotline|point)|ethicspoint|carbon markets|"
     r"co2 reduction strategy|ghg inventory|verification opinion|end user licen[cs]e|software licen[cs]e|"
     r"curriculum vitae|notification of registration|certificate of approval|certificate number|"
@@ -1697,7 +1732,7 @@ PAPERWORK_TITLE_RE = re.compile(
     r"purchase orders?|invoic(e|es|ing)|order confirmations?)", re.I)
 
 # plant / quality-system certificates, judged by file name only (data sheets often say "ISO 9001 certified")
-CERT_NAME_RE = re.compile(r"(?<![a-z0-9])(as|iso|iatf)[\s_-]?(9100|9001|14001|45001|50001|16949)(?![0-9])", re.I)
+CERT_NAME_RE = re.compile(r"(?<![a-z0-9])(as|iso|iatf)([\s_/-]?iec)?[\s_-]?(9100|9001|14001|27001|45001|50001|16949)(?![0-9])", re.I)
 
 # Avery Dennison medical: liquids and creams are not webs (dressings, tapes and films are)
 AVERY_NOT_WEB_RE = re.compile(r"(barrier film spray|\bspray\b|barrier cream|\bcream\b|\bswab\b|lotion|ointment)", re.I)
@@ -1708,16 +1743,90 @@ def topic_hits(text: str) -> int:
     return len({m.group(0).lower() for m in TOPIC_RE.finditer(text or "")})
 
 
-def topic_decision(vendor: str, name: str, text: str, keep_all_vendors: set | None = None) -> str | None:
+def vendor_scope_decision(scope, names: str, where: str = "") -> str | None:
+    """Per-vendor scope from vendor_seeds.csv (scope_keep / scope_exclude regexes, case-insensitive).
+    Returns "on", an off-topic reason, or None when the scope says nothing about this file.
+    names: file name + PDF title + first line(s); where: source URL and the page it was found on.
+    1. scope_exclude matching the URL / found-on page path wins (a whole site section is out of scope),
+       unless scope_keep matches the file's own name or title;
+    2. scope_keep matching the name / title keeps the file;
+    3. scope_exclude matching the name / title rejects it;
+    4. scope_keep matching only the URL / found-on page keeps it."""
+    if not scope:
+        return None
+    keep, exclude = scope
+    if keep is None and exclude is None:
+        return None
+    paths = " ".join(re.sub(r"^https?://[^/]+", "", u) for u in (where or "").split())
+    if exclude is not None and exclude.search(paths) and not (keep is not None and keep.search(names)):
+        return "off-topic (vendor scope)"
+    if keep is not None and keep.search(names):
+        return "on"
+    if exclude is not None and exclude.search(names):
+        return "off-topic (vendor scope)"
+    if keep is not None and keep.search(paths):
+        return "on"
+    return None
+
+
+# ---- Company paperwork (audit 2026-10-24) -------------------------------------------------------
+# Stock-exchange filings, purchasing / supplier paperwork, site rules, HR, policy papers and plant /
+# chain-of-custody certificates are not about webs even when a web vendor publishes them.
+# The two "strong" categories are matched on the name + first ~600 characters; the others only on the
+# name + first ~200 characters and only when the document has few on-topic terms (<= 6), so product
+# sheets that merely mention "ISO 9001" or a safety note are not caught.
+PAPERWORK_RULES = {
+ 'stock-exchange / statutory filings': r"stock exchange|listing (department|regulations)|scrip code|shareholding pattern|shareholders? whose|corporate governance report|board meeting|outcome of (the )?board|trading window|postal ballot|scrutini[sz]er|agm proceedings|voting results|unclaimed dividend|unpaid dividend|\biepf\b|form (no\.? )?(mgt|isr|inc|sh|15g|15h|10f|iv-a)|loss of share|insider trading|demerge[dr]|scheme of arrangement|resulting company|credit rating|memorandum and articles|related party transactions|sebi|newspaper (publication|advertisement)|securities and exchange commission|form f-4|prospectus|תשקיף|דוח (הדירקטוריון|תקופתי|כספי|שנתי)|רבעון|demonstra[cç][oõ]es financeiras|balan[cç]o patrimonial|country[- ]by[- ]country|cbcr|income tax report",
+ 'purchasing / supplier paperwork': r"conditions of purchase|general (contract )?(terms|conditions) of purchase|conditions? g[ée]n[ée]rales? d.achats?|condiciones generales de compra|condi[cç][oõ]es gerais de compra|allgemeine (einkaufs|vertrags|liefer)\w*|einkaufsbedingungen|ostoehdot|købsbetingelser|kjøpsvilkår|köpvillkor|inkoopvoorwaarden|warunki zakup|nákupní podmínky|obchodné podmienky nákupu|beszerzési feltételei|achiziție|nabavki|satın alma|закупок|покупка|pirkimo|iepirkuma|ostutingimused|supplier (diversity|manual|training|performance training|instructions|information request|portal)|coupa|ariba|source to pay|\bsnc\b|supply network collaboration|purchase order|government portal|vetting (platform|requirements)|change order protocol|master supplier agreement|tax[- ]exempt|pack list|credit card payment|returns processing|cyber security addendum|ai addendum|data act addendum|standardsoftware|bedingungen für die ausführung|contractor (rules|handbook|manual|requirements|presentation|safety)|kontraktoren|entrepren[oö]rsföreskrifter|vertragspartner|ayuda de trabajo|jobhilfe|pomoc stanowiskowa|supporto lavoro|ジョブエイド|サプライヤー",
+ 'site rules / safety / EHS': r"site regulations|standort-?ordnung|werkstra(ss|ß)enverkehrsordnung|betreten und befahren|werkschutz|safety (rules|training|regulations|guidance note)|säkerhetsinformation|safety information (for|when)|life saving rules|nine safety rules|task risk assessment|risk assessment (form|example)|\blockout|burner management|process safety management|emergency response|fire water|scaffold|angle grinding|high pressure (water )?(washing|cleaning)|she (plan|standards)|ehs (requirements|visitor)|sicherheitsunterweisung|säkerhet\w*|skydds|ordnings|råvaruhantering|bulkfartyg|anmälningsplikt|instrukcja w sprawie|szkolenie bhp|störfallverordnung|seveso|umweltinspektion|informationen für unsere nachbarn|information till allmänheten|stoppextra|selbstabholer|customer-?organi[sz]ed collections|adr kontrolle",
+ 'HR / people': r"gender pay|pay (gap|transparency)|wage report|דוח פומבי|דיווח פומבי|égalité hommes|index égalité|mental health|burnout|substance abuse|inclusive workplace|sexual harassment|retirees|pensioners|emeryt|employee (training|benefits)|values (and|&) leadership|principles about teamwork|whistleblow\w*|procedura zgłoszeń|complaints procedure|beschwerdeverfahren|cybersecurity all employees",
+ 'compliance / policy / position papers': r"code of conduct|c[oó]digo de conduct?a|modell?o (di organizzazione|of organi[sz]ation|organizzativo)|modello 231|compliance guideline|conflicts? of interest|human rights|menschenrecht\w*|statement of principles|stewardship framework|position (on|paper)|key messages|green deal|emission trading|eu ai act|industrial emission directive|transition pathway|biodiversity position|recommendations (on|for) (a )?circular economy|california transparency|deforestation regulation|eudr|politique (qhse|environnementale)|environmental policy|fibre procurement policy|polityka (zakupu|jakości)|politique qhse|qhse policy|politika společnosti|wood (sourcing|procurement)|program pracy sieci|sieci (ciepłowniczej|dystrybucyjnej)|taryfa|struktura paliw|czas trwania przerw|autoconsumo|co2 reduction|climate transition|plano de transi[cç][aã]o",
+ 'certificates (plant / chain-of-custody)': r"certificate of (registration|approval|conformance)|certificado de cadena de custodia|chain of custody|\bfsc\b.{0,40}certif|pefc|sfi certif|fiber sourcing|rainforest alliance|greencircle|kosher certificate|tisax|letter of conformance|responsible care|oea|authori[sz]ed economic operator|fssc 22000|c-?gmp certificate|organic content standard|cradle to cradle certif|vo[cç] emission test certificate|endorsement letter|preferred reed supplier|zertifikat|certifikát|osvedčenie|certyfikat|ecovadis|lab report|this certificate|certificate holder|certification (body|decision|scheme)",
+}
+PAPERWORK_RES = {k: re.compile(v, re.I) for k, v in PAPERWORK_RULES.items()}
+PAPERWORK_STRONG = {"stock-exchange / statutory filings", "purchasing / supplier paperwork"}
+# product certificates are kept: EU type-examination (PPE), declarations of performance / conformity
+PAPERWORK_CERT_EXEMPT_RE = re.compile(r"type[- ]examination|declaration of (performance|conformity)", re.I)
+
+
+def paperwork_category(name: str, text: str = "") -> str | None:
+    """Category of company paperwork the file belongs to, or None."""
+    ns = re.sub(r"[_\-]+", " ", name or "")
+    t = text or ""
+    strong_zone, zone = f"{ns} {t[:600]}", f"{ns} {t[:200]}"
+    hits = topic_hits(t[:15000])
+    for cat, rx in PAPERWORK_RES.items():
+        if cat in PAPERWORK_STRONG:
+            if rx.search(strong_zone):
+                return cat
+        elif hits <= 6 and rx.search(zone):
+            if cat.startswith("certificates") and PAPERWORK_CERT_EXEMPT_RE.search(strong_zone):
+                continue
+            return cat
+    return None
+
+
+def topic_decision(vendor: str, name: str, text: str, keep_all_vendors: set | None = None,
+                   scope=None, where: str = "") -> str | None:
     """None = on-topic (keep). Otherwise a short reason the file is off-topic.
-    vendor: vendor name; name: file stem + PDF title; text: first pages of extracted text."""
+    vendor: vendor name; name: file stem + PDF title; text: first pages of extracted text;
+    scope: (scope_keep, scope_exclude) from vendor_seeds.csv; where: source URL + found-on page."""
     t = (text or "")[:15000]
     head = f"{name} {t[:1500]}"
     first_line = next((ln for ln in t.splitlines() if ln.strip()), "")[:120]
-    if CORPORATE_ONLY_RE.search(f"{name} {t[:400]}") or CERT_NAME_RE.search(name) or \
-            PAPERWORK_TITLE_RE.search(f"{name} {first_line}") or \
+    name_sp = re.sub(r"[_\-]+", " ", name)            # 'Supplier-Quality-Manual' -> 'Supplier Quality Manual'
+    if CORPORATE_ONLY_RE.search(f"{name_sp} {t[:400]}") or CERT_NAME_RE.search(name) or \
+            PAPERWORK_TITLE_RE.search(f"{name_sp} {first_line}") or \
             re.search(r"noti\s*fi\s*cati\s*on of regi\s*strati\s*on", t[:400], re.I):
         return "off-topic (corporate)"
+    pc = paperwork_category(name, t)
+    if pc:
+        return f"off-topic (paperwork: {pc})"
+    vs = vendor_scope_decision(scope, f"{name} {t[:300]}", where)
+    if vs == "on":
+        return None
+    if vs:
+        return vs
     if keep_all_vendors and vendor in keep_all_vendors:
         return None
     v = (vendor or "").lower()
@@ -1742,13 +1851,18 @@ def topic_decision(vendor: str, name: str, text: str, keep_all_vendors: set | No
     return None
 
 
-def link_off_topic(vendor: str, url: str, anchor: str = "") -> bool:
+def link_off_topic(vendor: str, url: str, anchor: str = "", scope=None, found_on: str = "") -> bool:
     """Before download: skip links whose file name / link text alone shows they are off-topic
     (company paperwork, plant certificates, Sika construction product lines). Anything unclear is
     downloaded and judged on its content."""
     name = f"{Path(unquote(urlparse(url).path)).stem} {anchor}"
-    if CORPORATE_ONLY_RE.search(name) or CERT_NAME_RE.search(name) or PAPERWORK_TITLE_RE.search(name):
+    name_sp = re.sub(r"[_\-]+", " ", name)
+    if CORPORATE_ONLY_RE.search(name_sp) or CERT_NAME_RE.search(name) or PAPERWORK_TITLE_RE.search(name_sp) \
+            or paperwork_category(name):
         return True
+    vs = vendor_scope_decision(scope, name, f"{url} {found_on}")
+    if vs:
+        return vs != "on"
     v = (vendor or "").lower()
     if v.startswith("sika"):
         return bool(SIKA_CONSTRUCTION_LINE_RE.search(name)) and not SIKA_INDUSTRIAL_LINE_RE.search(name)
@@ -1924,6 +2038,12 @@ def decide_keep(f, doc_types: set, equipment_vendor: bool = False) -> str | None
     if strong and (score >= 1 or foreign):
         return None
     return "no technical content"
+
+
+def vendor_scopes(vendors: dict) -> dict:
+    """{vendor name: (scope_keep, scope_exclude)} for vendors whose seed row sets a scope."""
+    return {v.name: (v.scope_keep, v.scope_exclude) for v in vendors.values()
+            if v.scope_keep is not None or v.scope_exclude is not None}
 
 
 def equipment_vendors(vendors: dict) -> set:
@@ -2147,7 +2267,8 @@ def make_summary(text: str, filename: str) -> str:
 
 
 def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_rejected: bool = False,
-                   equipment_vendors: set | None = None, keep_off_topic: bool = False) -> int:
+                   equipment_vendors: set | None = None, keep_off_topic: bool = False,
+                   scopes: dict | None = None) -> int:
     try:
         from pypdf import PdfReader
     except ImportError:
@@ -2159,7 +2280,8 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
         log.info("Text extraction: pypdf %s", getattr(pypdf, "__version__", "?"))
     except Exception:
         pass
-    rows = db.query("SELECT f.sha256, f.path, f.vendor, l.doc_type AS link_type FROM files f "
+    scopes = scopes or {}
+    rows = db.query("SELECT f.sha256, f.path, f.vendor, f.first_url, l.found_on, l.doc_type AS link_type FROM files f "
                     "LEFT JOIN pdf_links l ON l.url = f.first_url" +
                     ("" if redo else " WHERE f.classified_at IS NULL OR f.language IS NULL OR f.summary IS NULL"
                                     " OR f.tech_score IS NULL OR f.text_chars IS NULL"
@@ -2202,7 +2324,9 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
         topic = None
         if read_ok:
             topic = topic_decision(row["vendor"], f"{Path(row['path']).stem} {meta_t}",
-                                   unicodedata.normalize("NFKC", text), TOPIC_KEEP_ALL_VENDORS) or "on"
+                                   unicodedata.normalize("NFKC", text), TOPIC_KEEP_ALL_VENDORS,
+                                   scope=scopes.get(row["vendor"]),
+                                   where=f"{row['first_url'] or ''} {row['found_on'] or ''}") or "on"
         db.execute("UPDATE files SET pages=?, title=?, text_doc_type=?, test_methods=?, method_families=?, "
                    "language=?, summary=?, tech_score=?, evidence=?, pdf_title=?, text_chars=?, rules_version=?, "
                    "topic=?, classified_at=? WHERE sha256=?",
@@ -2615,7 +2739,8 @@ def main(argv=None):
         if args.classify and not STOP.is_set():
             backfill_link_lang(db)
             classify_files(db, root, redo=args.reclassify, doc_types=args.doc_types, keep_rejected=args.keep_rejected,
-                           equipment_vendors=equipment_vendors(vendors_all), keep_off_topic=args.keep_off_topic)
+                           equipment_vendors=equipment_vendors(vendors_all), keep_off_topic=args.keep_off_topic,
+                           scopes=vendor_scopes(vendors_all))
             if args.download and not args.keep_translations and not STOP.is_set():
                 more = queue_english_guesses(db, vendors_all, only={v.name for v in chosen})
                 if more:
@@ -2623,7 +2748,7 @@ def main(argv=None):
                     run_parallel(lambda v: download_vendor(v, db, args, root), more, args.workers)
                     classify_files(db, root, redo=False, doc_types=args.doc_types, keep_rejected=args.keep_rejected,
                                    equipment_vendors=equipment_vendors(vendors_all),
-                                   keep_off_topic=args.keep_off_topic)
+                                   keep_off_topic=args.keep_off_topic, scopes=vendor_scopes(vendors_all))
             reorganize_files(db, vendors_all, root)
         if args.export:
             export_manifest(db, vendors_all, root)
