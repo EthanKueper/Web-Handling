@@ -27,6 +27,7 @@ Typical use:
 from __future__ import annotations
 
 import argparse
+import html as html_lib
 import csv
 import gzip
 import hashlib
@@ -40,7 +41,7 @@ import sys
 import threading
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,13 +73,14 @@ DEFAULT_WORKBOOK = Path(r"D:\tds_corpus\input\Vendors_With_Technical_Sheets_By_M
 DEFAULT_SEEDS = Path(r"D:\tds_corpus\input\vendor_seeds.csv")
 
 USER_AGENT_BASE = "TDSCollector/1.0 (technical datasheet research)"
-BUILD = "2026-10-24 r14"        # shown at startup - tells you which version of the script actually ran
+BUILD = "2026-10-25 r22"        # shown at startup - tells you which version of the script actually ran
 RULES_VERSION = 12              # bump when classification rules change: files are re-scored automatically
                                 # (r14 paperwork rules were applied to the corpus by the 2026-10-24 audit, so
                                 #  no bump - they apply to new downloads; bump to re-check every file)
 DEFAULT_DELAY_S = 2.0          # min seconds between requests to the same vendor
 DEFAULT_MAX_PAGES = 400        # HTML pages fetched per vendor per discovery run
 DEFAULT_MAX_DEPTH = 4
+SLOW_HOST_DELAY = 10           # seconds: hosts asking for longer pauses get no guessed-URL downloads
 DEFAULT_WORKERS = 4            # vendors crawled in parallel (one thread each)
 DEFAULT_MAX_PDF_MB = 50
 DEFAULT_DOC_TYPES = "tds,sds,brochure,certificate,other"   # corporate skipped; SDSs kept (material safety data)
@@ -228,6 +230,27 @@ TEST_METHOD_PATTERNS = [
 
 log = logging.getLogger("tds")
 STOP = threading.Event()
+ACTIVITY: dict[int, tuple[float, str]] = {}   # thread id -> (started, what it is doing), for the heartbeat log
+MAX_DOWNLOAD_SECONDS = 300     # a single PDF download is abandoned (and retried next run) after this long
+HEARTBEAT_SECONDS = 300        # every 5 minutes the log says what each worker is busy with
+
+
+def doing(what: str) -> None:
+    ACTIVITY[threading.get_ident()] = (time.time(), what)
+
+
+def heartbeat() -> None:
+    """Background thread: every few minutes, log what each worker is doing, so a long quiet stretch
+    (a slow site, a big PDF, a 60 s crawl-delay) is visibly not a freeze."""
+    while not STOP.wait(HEARTBEAT_SECONDS):
+        now = time.time()
+        busy = sorted(ACTIVITY.values())
+        if not busy:
+            continue
+        log.info("Still working - %d worker(s) busy:", len(busy))
+        for started, what in busy:
+            age = int(now - started)
+            log.info("   %s (%s)", what[:160], f"{age // 60} min {age % 60} s" if age >= 60 else f"{age} s")
 
 
 # =============================================================================
@@ -316,7 +339,13 @@ def score_link(url: str, anchor: str = "") -> int:
                 s += w
         elif term in tokens:
             s += w
+    # product detail pages carry the data-sheet links: visit them before more listing / filter pages
+    if PRODUCT_PAGE_RE.search(p.path):
+        s += 4
     return s
+
+
+PRODUCT_PAGE_RE = re.compile(r"/p/dc?/[^/]+|/products?/[^/]+/?$|/product-detail", re.I)
 
 
 def classify_doc_type(text: str) -> str:
@@ -489,6 +518,7 @@ class Vendor:
     notes: str = ""
     scope_keep: object = None                                   # seeds.csv "scope_keep": compiled regex or None
     scope_exclude: object = None                                # seeds.csv "scope_exclude": compiled regex or None
+    max_pages: int = 0                                          # seeds.csv "max_pages": per-vendor page cap (0 = --max-pages)
 
     @property
     def slug(self) -> str:
@@ -559,7 +589,7 @@ def load_workbook_vendors(path: Path) -> dict[str, Vendor]:
 
 
 SEED_FIELDS = ["vendor", "status", "domains", "start_urls", "path_prefixes", "render_js", "folder",
-               "pdf_filter", "scope_keep", "scope_exclude", "notes"]
+               "pdf_filter", "scope_keep", "scope_exclude", "max_pages", "notes"]
 
 
 def merge_seeds(vendors: dict[str, Vendor], seeds_path: Path) -> None:
@@ -583,6 +613,8 @@ def merge_seeds(vendors: dict[str, Vendor], seeds_path: Path) -> None:
         v.render_js = str(row.get("render_js", "0")).strip() in ("1", "true", "yes", "y")
         v.notes = row.get("notes", "") or ""
         v.folder_override = (row.get("folder") or "").strip()
+        mp = (row.get("max_pages") or "").strip()
+        v.max_pages = int(mp) if mp.isdigit() else 0
         pf = (row.get("pdf_filter") or "").strip()
         if pf:
             m = re.match(r"^([a-z0-9.-]+\.[a-z]{2,}):(.+)$", pf, re.I)
@@ -723,6 +755,38 @@ class DB:
 # =============================================================================
 # HTTP / robots
 # =============================================================================
+def robots_longest_match(lines, url: str) -> bool:
+    """Python's robotparser applies the first matching rule, so "Disallow: /" followed by
+    "Allow: /api/public/" blocks everything. Sites (and Google) mean the longest match: re-check the
+    rules for "User-agent: *" that way. Returns True when the most specific matching rule is Allow."""
+    if not lines:
+        return False
+    p = urlparse(url)
+    path = (p.path or "/") + (f"?{p.query}" if p.query else "")
+    rules, in_star, prev_ua = [], False, False
+    for raw in lines:
+        line = raw.split("#", 1)[0].strip()
+        if ":" not in line:
+            continue
+        key, val = (x.strip() for x in line.split(":", 1))
+        key = key.lower()
+        if key == "user-agent":
+            in_star = (val == "*") or (in_star and prev_ua)
+            prev_ua = True
+            continue
+        prev_ua = False
+        if in_star and key in ("allow", "disallow") and val:
+            rx = re.escape(val).replace(r"\*", ".*")
+            if rx.endswith(r"\$"):
+                rx = rx[:-2] + "$"
+            rules.append((len(val), key == "allow", re.compile(rx)))
+    best = None
+    for ln, allow, rx in rules:
+        if rx.match(path) and (best is None or ln > best[0] or (ln == best[0] and allow)):
+            best = (ln, allow)
+    return bool(best and best[1])
+
+
 class Fetcher:
     """One per worker thread: session, robots cache, per-host pacing."""
 
@@ -753,6 +817,7 @@ class Fetcher:
             if r.status_code == 200 and "html" not in r.headers.get("Content-Type", ""):
                 lines = r.text.splitlines()
                 rp.parse(lines)
+                rp._tds_lines = lines            # kept for longest-match Allow rules (see allowed())
                 sitemaps = [l.split(":", 1)[1].strip() for l in lines
                             if l.lower().startswith("sitemap:")]
             elif r.status_code in (401, 403):
@@ -769,7 +834,9 @@ class Fetcher:
         if self.args.ignore_robots:
             return True
         rp = self._robots_for(url)
-        return rp.can_fetch(self.ua, url) if rp else True
+        if not rp or rp.can_fetch(self.ua, url):
+            return True
+        return robots_longest_match(getattr(rp, "_tds_lines", None), url)
 
     def crawl_delay(self, url: str) -> float:
         rp = self._robots_for(url)
@@ -931,15 +998,16 @@ class VendorCrawler:
         self.db.execute("INSERT OR IGNORE INTO pages(url, vendor, depth, score, state) VALUES (?,?,?,?, 'queued')",
                         (url, self.v.name, depth, score))
 
-    def add_pdf(self, url: str, found_on: str, anchor: str):
+    def add_pdf(self, url: str, found_on: str, anchor: str, trusted: bool = False):
+        """trusted: the link comes from the vendor's own document API (any host, no brand filter)."""
         url = canon_url(url)
-        if not url or url in self.known_pdfs or not self.pdf_allowed_host(url):
-            return
+        if not url or url in self.known_pdfs or not (trusted or self.pdf_allowed_host(url)):
+            return False
         self.known_pdfs.add(url)
         text = f"{unquote(urlparse(url).path)} {anchor}"
-        filt = self.v.filter_for(host_of(url))
+        filt = None if trusted else self.v.filter_for(host_of(url))
         if filt is not None and not filt.search(text):
-            return  # another company's sheet on a shared (distributor) site
+            return False  # another company's sheet on a shared (distributor) site
         dtype = classify_doc_type(text)
         segs = {sg.lower() for u in (url, found_on or "") for sg in urlparse(u).path.split("/") if sg}
         if segs & CORPORATE_SEGMENTS or NAME_JUNK_RE.search(stem_of(url)):
@@ -948,6 +1016,7 @@ class VendorCrawler:
             "INSERT OR IGNORE INTO pdf_links(url, vendor, found_on, anchor, doc_type, first_seen, lang) "
             "VALUES (?,?,?,?,?,?,?)",
             (url, self.v.name, found_on, (anchor or "")[:300], dtype, utcnow(), translation_info(url)[0]))
+        return True
 
     def load_state(self) -> bool:
         """Restore queue from DB. Returns True if there was prior state."""
@@ -1039,6 +1108,7 @@ class VendorCrawler:
                     self.enqueue(u, depth + 1, sc)
 
     def fetch_page(self, url: str, depth: int) -> tuple[str, int | None, str]:
+        doing(f"[{self.v.name}] reading page {url}")
         if not self.f.allowed(url):
             return "blocked", None, "robots.txt"
         use_js = self.v.render_js and self.args.js
@@ -1072,8 +1142,24 @@ class VendorCrawler:
         self.extract(final, html, depth)
         return "done", r.status_code, ""
 
+    # ---- document APIs (sites whose document library is loaded by JavaScript) -----------------
+    def api_seed(self):
+        for r in self.db.query("SELECT url FROM pdf_links WHERE vendor=?", (self.v.name,)):
+            self.known_pdfs.add(r["url"])
+        if any(host_allowed(d, ["qnityelectronics.com"]) for d in self.v.domains):
+            n = qnity_resource_center(self)
+            log.info("[%s] resource-center API: %d document link(s)", self.v.name, n)
+        if not self.args.no_wp_media:
+            n = wordpress_media_pdfs(self)
+            if n:
+                log.info("[%s] WordPress media library: %d PDF link(s)", self.v.name, n)
+
     def run(self):
         v = self.v
+        try:
+            self.api_seed()
+        except Exception as e:
+            log.warning("[%s] document API failed: %s", v.name, e)
         if not self.args.recrawl:
             row = self.db.query("SELECT discovery_done FROM vendors WHERE vendor=?", (v.name,))
             if row and row[0]["discovery_done"]:
@@ -1104,8 +1190,9 @@ class VendorCrawler:
         else:
             log.info("[%s] resuming: %d queued pages", v.name, len(self.heap))
 
+        cap = v.max_pages or self.args.max_pages
         fetched = 0
-        while self.heap and fetched < self.args.max_pages and not STOP.is_set():
+        while self.heap and fetched < cap and not STOP.is_set():
             _, _, url, depth, score = heapq.heappop(self.heap)
             state, code, err = self.fetch_page(url, depth)
             fetched += 1
@@ -1121,8 +1208,96 @@ class VendorCrawler:
             self.renderer.close()
         log.info("[%s] discovery %s: %d pages fetched, %d PDF links known%s",
                  v.name, "complete" if done else ("interrupted" if STOP.is_set() else "paused"), fetched, len(self.known_pdfs),
-                 f" (page cap {self.args.max_pages} reached, {len(self.heap)} left queued - re-run --discover to continue)"
-                 if self.heap and fetched >= self.args.max_pages else "")
+                 f" (page cap {cap} reached, {len(self.heap)} left queued - re-run --discover to continue)"
+                 if self.heap and fetched >= cap else "")
+
+
+# WordPress sites list every uploaded file through their public REST API. Many vendor sites only link a
+# few of their PDFs from crawlable pages (the rest sit behind filters, accordions or forms), so the
+# media library is asked for all PDFs. robots.txt is honoured for the API address.
+WP_MEDIA_MAX_PAGES = 30          # x 100 files
+
+
+def wordpress_media_pdfs(crawler: "VendorCrawler") -> int:
+    bases = sorted({f"{urlparse(u).scheme}://{urlparse(u).netloc}" for u in crawler.v.start_urls if u})
+    n = 0
+    for base in bases:
+        api = f"{base}/wp-json/wp/v2/media"
+        for page in range(1, WP_MEDIA_MAX_PAGES + 1):
+            if STOP.is_set():
+                return n
+            url = f"{api}?mime_type=application/pdf&per_page=100&page={page}&_fields=source_url,title"
+            if not crawler.f.allowed(url):
+                break
+            try:
+                r = crawler.f.get(url)
+                if r.status_code != 200 or "json" not in r.headers.get("Content-Type", ""):
+                    break
+                items = r.json()
+            except (requests.RequestException, ValueError):
+                break
+            if not isinstance(items, list) or not items:
+                break
+            for it in items:
+                src = it.get("source_url") or ""
+                title = it.get("title") or {}
+                title = html_lib.unescape(title.get("rendered", "") if isinstance(title, dict) else str(title))
+                if src.lower().split("?")[0].endswith(".pdf") and \
+                        crawler.add_pdf(src, f"{base}/wp-json/wp/v2/media", title):
+                    n += 1
+            if len(items) < 100 or page >= int(r.headers.get("X-WP-TotalPages", page) or page):
+                break
+    return n
+
+
+# Qnity Electronics (former DuPont Electronics): the Resource Center is a JavaScript app that loads its
+# document list from POST /api/resource-center; the files live on a Sitecore Content Hub host with no
+# ".pdf" in the URL, so ordinary crawling finds nothing.
+QNITY_LITERATURE_TYPES = ("technical-data-sheet", "product-data-sheet", "product-information-sheet",
+                          "technical-information", "brochure", "product-overview", "application",
+                          "safety-data-sheet-(sds)")
+# product groups that are webs / web converting (films, laminates, flex circuits, dry-film resists,
+# insulation papers and composites, thermal tapes); Kalrez seals, semiconductor chemicals and display
+# materials are left out
+QNITY_KEEP_TAG_RE = re.compile(r"printed-circuit-board|thermal-management|electrical-insulation|polyimide|"
+                               r"laminate|circuit-imaging|flexible|kapton|pyralux|oasis|temprion|riston|interra|"
+                               r"coverlay|bondply|film", re.I)
+QNITY_DROP_TAG_RE = re.compile(r"perfluoroelastomer|kalrez|semiconductor|ekc|display-and-lighting|"
+                               r"industrial-finishing", re.I)
+
+
+def qnity_resource_center(crawler: "VendorCrawler") -> int:
+    base = "https://www.qnityelectronics.com"
+    found_on = f"{base}/resource-center"
+    seen, n = set(), 0
+    for lt in QNITY_LITERATURE_TYPES:
+        if STOP.is_set():
+            break
+        crawler.f._pace(base + "/api/resource-center")
+        try:
+            r = crawler.f.s.post(base + "/api/resource-center", timeout=120,
+                                 json={"tagIds": [f"electronics:literature-type/{lt}"], "tagNames": [],
+                                       "articleTagNames": [], "excludeTagIds": [], "excludeTagNames": [],
+                                       "folderCategoryName": "", "language": "en"})
+            results = r.json().get("results", []) if r.status_code == 200 else []
+        except (requests.RequestException, ValueError) as e:
+            log.debug("qnity %s: %s", lt, e)
+            continue
+        for it in results:
+            url = it.get("url") or ""
+            if not url or url in seen or it.get("isSecure") or it.get("isLocked"):
+                continue
+            if (it.get("fileType") or "PDF").upper() != "PDF":
+                continue
+            tags = " ".join(it.get("matchedTags") or [])
+            title = it.get("title") or ""
+            text = f"{title} {tags}"
+            if QNITY_DROP_TAG_RE.search(text) or not QNITY_KEEP_TAG_RE.search(text):
+                continue
+            seen.add(url)
+            crawler.add_pdf(url, f"{found_on}?tagId=electronics:literature-type/{lt}", title, trusted=True)
+            n += 1
+    return n
 
 
 # =============================================================================
@@ -1135,14 +1310,28 @@ def filename_from_response(r: requests.Response, url: str) -> str:
     cd = r.headers.get("Content-Disposition", "")
     m = re.search(r"filename\*\s*=\s*[^']*''([^;]+)", cd) or re.search(r'filename\s*=\s*"?([^";]+)"?', cd)
     if m:
-        return safe_filename(m.group(1))
+        name = unquote(m.group(1))
+        if re.search(r"%[0-9A-Fa-f]{2}", name):      # double-encoded ('%2520' -> '%20' -> ' ')
+            name = unquote(name)
+        return safe_filename(name)
     last = urlparse(r.url or url).path.rstrip("/").rsplit("/", 1)[-1]
     return safe_filename(last or "document")
+
+
+def fetch_url(url: str) -> str:
+    """The address to request for a PDF link. Dow sends plain /documents/...pdf requests to its HTML
+    document viewer; the same address with ?iframe=true returns the PDF itself."""
+    p = urlparse(url)
+    if host_allowed(p.hostname or "", ["dow.com"]) and "/documents/" in p.path and \
+            p.path.lower().endswith(".pdf") and "iframe=" not in p.query:
+        return url + ("&" if p.query else "?") + "iframe=true"
+    return url
 
 
 def _download_one(row, f: Fetcher, db: DB, args, root: Path, vendor: Vendor, out_dir: Path) -> str:
     """Download one pdf_links row. Returns the resulting state."""
     url = row["url"]
+    doing(f"[{vendor.name}] downloading {url}")
     max_bytes = args.max_pdf_mb * 1024 * 1024
     if not f.allowed(url):
         db.execute("UPDATE pdf_links SET state='robots' WHERE url=?", (url,))
@@ -1156,7 +1345,7 @@ def _download_one(row, f: Fetcher, db: DB, args, root: Path, vendor: Vendor, out
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp = out_dir / f".part_{threading.get_ident()}"
     try:
-        r = f.get(url, stream=True, headers=hdrs)
+        r = f.get(fetch_url(url), stream=True, headers=hdrs)
     except requests.RequestException as e:
         db.execute("UPDATE pdf_links SET state='error', error=?, attempts=attempts+1 WHERE url=?",
                    (str(e)[:300], url))
@@ -1175,10 +1364,14 @@ def _download_one(row, f: Fetcher, db: DB, args, root: Path, vendor: Vendor, out
             return "too_large"
         h = hashlib.sha256()
         size, head, ok = 0, b"", True
+        t0, too_slow = time.time(), False
         with open(tmp, "wb") as fh:
             for chunk in r.iter_content(65536):
                 if STOP.is_set():
                     ok = False
+                    break
+                if time.time() - t0 > MAX_DOWNLOAD_SECONDS:
+                    ok, too_slow = False, True
                     break
                 if len(head) < 1024:
                     head += chunk[:1024 - len(head)]
@@ -1195,6 +1388,11 @@ def _download_one(row, f: Fetcher, db: DB, args, root: Path, vendor: Vendor, out
             tmp.unlink(missing_ok=True)
             if STOP.is_set():
                 return "stopped"
+            if too_slow:
+                db.execute("UPDATE pdf_links SET state='error', error=?, attempts=attempts+1 WHERE url=?",
+                           (f"download took over {MAX_DOWNLOAD_SECONDS} s - will retry next run", url))
+                log.info("  %s: gave up after %d s (slow server), will retry next run", url, MAX_DOWNLOAD_SECONDS)
+                return "error"
             state = "too_large" if size > max_bytes else "not_pdf"
             db.execute("UPDATE pdf_links SET state=?, http_status=?, attempts=attempts+1 WHERE url=?",
                        (state, r.status_code, url))
@@ -1286,6 +1484,20 @@ def tidy_translations(db: DB, vendor: Vendor, make_guesses: bool) -> int:
     return marked
 
 
+def ensure_vendor_folders(vendors: dict, root: Path) -> int:
+    """One folder per workbook vendor under pdfs/<Category>/<Vendor>/, created even before anything is
+    downloaded, so a vendor with no files yet is easy to spot."""
+    n = 0
+    for v in vendors.values():
+        d = v.pdf_dir(root)
+        if not d.exists():
+            d.mkdir(parents=True, exist_ok=True)
+            n += 1
+    if n:
+        log.info("Created %d empty vendor folder(s) under pdfs/", n)
+    return n
+
+
 def download_vendor(vendor: Vendor, db: DB, args, root: Path) -> dict:
     f = Fetcher(args)
     types = set(args.doc_types)
@@ -1299,6 +1511,15 @@ def download_vendor(vendor: Vendor, db: DB, args, root: Path) -> dict:
     rows = db.query(
         f"SELECT * FROM pdf_links WHERE vendor=? AND state IN ({','.join('?' * len(states))}) "
         f"AND attempts < ? ORDER BY url", (vendor.name, *states, args.max_attempts if not args.refresh else 999))
+    # guessed English URLs are mostly misses; on hosts that ask for long pauses between requests (Barmag:
+    # 60 s) trying them would take hours, so they are skipped there
+    slow = [r for r in rows if r["found_on"] == "english-guess" and f.crawl_delay(r["url"]) > SLOW_HOST_DELAY]
+    if slow:
+        for r in slow:
+            db.execute("UPDATE pdf_links SET state='guess_failed', error='skipped: slow host' WHERE url=?", (r["url"],))
+        log.info("[%s] skipped %d guessed English URL(s) on a slow host (robots.txt crawl-delay > %ds)",
+                 vendor.name, len(slow), SLOW_HOST_DELAY)
+        rows = [r for r in rows if r not in slow]
 
     def tally(state: str):
         if state in ("downloaded", "duplicate", "unchanged"):
@@ -1461,9 +1682,10 @@ def reorganize_files(db: DB, vendors: dict[str, Vendor], root: Path) -> int:
         db.execute("UPDATE files SET path=? WHERE sha256=?", (new_rel, row["sha256"]))
         db.execute("UPDATE pdf_links SET path=? WHERE sha256=?", (new_rel, row["sha256"]))
         moved += 1
+    keep_dirs = {v.pdf_dir(root) for v in vendors.values()}      # every vendor keeps its folder, even empty
     for d in sorted(old_dirs, key=lambda p: len(p.parts), reverse=True):
         try:
-            if d != root / "pdfs" and not any(d.iterdir()):
+            if d != root / "pdfs" and d not in keep_dirs and not any(d.iterdir()):
                 d.rmdir()
         except OSError:
             pass
@@ -1777,11 +1999,12 @@ def vendor_scope_decision(scope, names: str, where: str = "") -> str | None:
 # sheets that merely mention "ISO 9001" or a safety note are not caught.
 PAPERWORK_RULES = {
  'stock-exchange / statutory filings': r"stock exchange|listing (department|regulations)|scrip code|shareholding pattern|shareholders? whose|corporate governance report|board meeting|outcome of (the )?board|trading window|postal ballot|scrutini[sz]er|agm proceedings|voting results|unclaimed dividend|unpaid dividend|\biepf\b|form (no\.? )?(mgt|isr|inc|sh|15g|15h|10f|iv-a)|loss of share|insider trading|demerge[dr]|scheme of arrangement|resulting company|credit rating|memorandum and articles|related party transactions|sebi|newspaper (publication|advertisement)|securities and exchange commission|form f-4|prospectus|תשקיף|דוח (הדירקטוריון|תקופתי|כספי|שנתי)|רבעון|demonstra[cç][oõ]es financeiras|balan[cç]o patrimonial|country[- ]by[- ]country|cbcr|income tax report",
- 'purchasing / supplier paperwork': r"conditions of purchase|general (contract )?(terms|conditions) of purchase|conditions? g[ée]n[ée]rales? d.achats?|condiciones generales de compra|condi[cç][oõ]es gerais de compra|allgemeine (einkaufs|vertrags|liefer)\w*|einkaufsbedingungen|ostoehdot|købsbetingelser|kjøpsvilkår|köpvillkor|inkoopvoorwaarden|warunki zakup|nákupní podmínky|obchodné podmienky nákupu|beszerzési feltételei|achiziție|nabavki|satın alma|закупок|покупка|pirkimo|iepirkuma|ostutingimused|supplier (diversity|manual|training|performance training|instructions|information request|portal)|coupa|ariba|source to pay|\bsnc\b|supply network collaboration|purchase order|government portal|vetting (platform|requirements)|change order protocol|master supplier agreement|tax[- ]exempt|pack list|credit card payment|returns processing|cyber security addendum|ai addendum|data act addendum|standardsoftware|bedingungen für die ausführung|contractor (rules|handbook|manual|requirements|presentation|safety)|kontraktoren|entrepren[oö]rsföreskrifter|vertragspartner|ayuda de trabajo|jobhilfe|pomoc stanowiskowa|supporto lavoro|ジョブエイド|サプライヤー",
+ 'purchasing / supplier paperwork': r"conditions of purchase|general (contract )?(terms|conditions) of purchase|conditions? g[ée]n[ée]rales? d.achats?|condiciones generales de compra|condi[cç][oõ]es gerais de compra|allgemeine (einkaufs|vertrags|liefer)\w*|einkaufsbedingungen|ostoehdot|købsbetingelser|kjøpsvilkår|köpvillkor|inkoopvoorwaarden|warunki zakup|nákupní podmínky|obchodné podmienky nákupu|beszerzési feltételei|achiziție|nabavki|satın alma|закупок|покупка|pirkimo|iepirkuma|ostutingimused|supplier (diversity|manual|training|performance training|instructions|information request|portal|standards|requirements|code)|coupa|ariba|source to pay|\bsnc\b|supply network collaboration|purchase order|government portal|vetting (platform|requirements)|change order protocol|master supplier agreement|tax[- ]exempt|pack list|credit card payment|returns processing|cyber security addendum|ai addendum|data act addendum|standardsoftware|bedingungen für die ausführung|contractor (rules|handbook|manual|requirements|presentation|safety)|kontraktoren|entrepren[oö]rsföreskrifter|vertragspartner|ayuda de trabajo|jobhilfe|pomoc stanowiskowa|supporto lavoro|ジョブエイド|サプライヤー",
  'site rules / safety / EHS': r"site regulations|standort-?ordnung|werkstra(ss|ß)enverkehrsordnung|betreten und befahren|werkschutz|safety (rules|training|regulations|guidance note)|säkerhetsinformation|safety information (for|when)|life saving rules|nine safety rules|task risk assessment|risk assessment (form|example)|\blockout|burner management|process safety management|emergency response|fire water|scaffold|angle grinding|high pressure (water )?(washing|cleaning)|she (plan|standards)|ehs (requirements|visitor)|sicherheitsunterweisung|säkerhet\w*|skydds|ordnings|råvaruhantering|bulkfartyg|anmälningsplikt|instrukcja w sprawie|szkolenie bhp|störfallverordnung|seveso|umweltinspektion|informationen für unsere nachbarn|information till allmänheten|stoppextra|selbstabholer|customer-?organi[sz]ed collections|adr kontrolle",
  'HR / people': r"gender pay|pay (gap|transparency)|wage report|דוח פומבי|דיווח פומבי|égalité hommes|index égalité|mental health|burnout|substance abuse|inclusive workplace|sexual harassment|retirees|pensioners|emeryt|employee (training|benefits)|values (and|&) leadership|principles about teamwork|whistleblow\w*|procedura zgłoszeń|complaints procedure|beschwerdeverfahren|cybersecurity all employees",
  'compliance / policy / position papers': r"code of conduct|c[oó]digo de conduct?a|modell?o (di organizzazione|of organi[sz]ation|organizzativo)|modello 231|compliance guideline|conflicts? of interest|human rights|menschenrecht\w*|statement of principles|stewardship framework|position (on|paper)|key messages|green deal|emission trading|eu ai act|industrial emission directive|transition pathway|biodiversity position|recommendations (on|for) (a )?circular economy|california transparency|deforestation regulation|eudr|politique (qhse|environnementale)|environmental policy|fibre procurement policy|polityka (zakupu|jakości)|politique qhse|qhse policy|politika společnosti|wood (sourcing|procurement)|program pracy sieci|sieci (ciepłowniczej|dystrybucyjnej)|taryfa|struktura paliw|czas trwania przerw|autoconsumo|co2 reduction|climate transition|plano de transi[cç][aã]o",
- 'certificates (plant / chain-of-custody)': r"certificate of (registration|approval|conformance)|certificado de cadena de custodia|chain of custody|\bfsc\b.{0,40}certif|pefc|sfi certif|fiber sourcing|rainforest alliance|greencircle|kosher certificate|tisax|letter of conformance|responsible care|oea|authori[sz]ed economic operator|fssc 22000|c-?gmp certificate|organic content standard|cradle to cradle certif|vo[cç] emission test certificate|endorsement letter|preferred reed supplier|zertifikat|certifikát|osvedčenie|certyfikat|ecovadis|lab report|this certificate|certificate holder|certification (body|decision|scheme)",
+ 'certificates (plant / chain-of-custody)': r"certificate of (registration|approval|conformance)|certificado de cadena de custodia|chain of custody|\bfsc\b.{0,40}certif|pefc|sfi certif|fiber sourcing|rainforest alliance|greencircle|kosher certificate|tisax|letter of conformance|responsible care|oea|authori[sz]ed economic operator|fssc 22000|c-?gmp certificate|organic content standard|cradle to cradle certif|vo[cç] emission test certificate|endorsement letter|preferred reed supplier|zertifikat|certifikát|osvedčenie|certyfikat|ecovadis|lab report|this certificate|certificate holder|certification (body|decision|scheme)|brcgs|\bbrc\b.{0,30}certif|halal|haccp|\bgmp\b.{0,20}(certif|aib)|\bmsc\b.{0,20}certif|iso.?certification|attestazione soa|ghg verification|温室气体核查",
+ 'news / HR / corporate misc': r"press release|presseerkl[aä]rung|news release|obituary|appoints new|team updates|^stelle\b|stellenangebot|job (offer|opening|posting)|gender (gap|pay)|due diligence|anti-?bribery|anti-?corruption|business gifts|hospitality procedures|global directory|request for information|eu entities|european entities|cartel (idi|publicidad)|descripcion ?proyecto|open source|license conditions|apache license|bsd-[23]-clause|\bmit\b.{0,20}license|postgresql licen[cs]e|sqlite copyright|how to find|ship notice|bank details|credit memo|forwarding agency|classroom activity|family activity|scholarship|employee assistance|supplemental insurance",
 }
 PAPERWORK_RES = {k: re.compile(v, re.I) for k, v in PAPERWORK_RULES.items()}
 PAPERWORK_STRONG = {"stock-exchange / statutory filings", "purchasing / supplier paperwork"}
@@ -2292,6 +2515,7 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
         if STOP.is_set():
             break
         p = root / row["path"]
+        doing(f"classifying {row['path']} ({n + 1} of {len(rows)})")
         title, pages, text = "", None, ""
         rd = None
         read_ok = True
@@ -2333,6 +2557,7 @@ def classify_files(db: DB, root: Path, redo: bool = False, doc_types=None, keep_
                    (pages, title, dtype, "; ".join(methods), "; ".join(fams), lang, summary, tscore, evid,
                     meta_t[:200], len(re.sub(r"\s", "", text)), RULES_VERSION, topic, utcnow(), row["sha256"]))
         n += 1
+    ACTIVITY.pop(threading.get_ident(), None)
     log.info("Classified %d file(s)", n)
     if unread:
         crypto = sum("cryptography" in e for e in unread)
@@ -2410,6 +2635,7 @@ def export_manifest(db: DB, vendors: dict[str, Vendor], root: Path) -> Path:
         ORDER BY f.vendor, f.path""")
     with open(out, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
+        clean = lambda row: [CONTROL_CHARS_RE.sub(" ", x) if isinstance(x, str) else x for x in row]
         w.writerow(["vendor", "categories", "category_folder", "path", "bytes", "pages", "title", "language",
                     "is_translated_copy", "english_version", "rejected_as", "tech_score", "evidence", "doc_type_from_text",
                     "doc_type_from_link", "test_methods", "method_families", "source_url", "anchor_text",
@@ -2422,11 +2648,11 @@ def export_manifest(db: DB, vendors: dict[str, Vendor], root: Path) -> Path:
                 eng = r["english_path"] or "NOT FOUND"
             else:
                 eng = ""
-            w.writerow([r["vendor"], cats.get(r["vendor"], ""), folders.get(r["vendor"], ""), r["path"], r["bytes"],
+            w.writerow(clean([r["vendor"], cats.get(r["vendor"], ""), folders.get(r["vendor"], ""), r["path"], r["bytes"],
                         r["pages"], r["title"], lang, "yes" if r["is_translation"] else "", eng, r["rejected"] or "", r["tech_score"], r["evidence"] or "",
                         r["text_doc_type"], r["link_doc_type"], r["test_methods"], r["method_families"],
                         r["first_url"], r["anchor"], r["found_on"], r["last_modified"], r["added_at"],
-                        r["url_count"], r["sha256"]])
+                        r["url_count"], r["sha256"]]))
     log.info("Manifest written: %s (%d rows)", out, len(rows))
     return out
 
@@ -2614,6 +2840,8 @@ def parse_args(argv=None):
                     help=f"which link types to download: {','.join(ALL_DOC_TYPES)} or 'all'")
     ap.add_argument("--max-pdf-mb", type=int, default=DEFAULT_MAX_PDF_MB)
     ap.add_argument("--max-attempts", type=int, default=3, help="give up on a PDF after N failed attempts")
+    ap.add_argument("--no-wp-media", action="store_true",
+                    help="don't ask WordPress sites' media library API for their PDF list during --discover")
     ap.add_argument("--recrawl", action="store_true", help="redo discovery for vendors already completed")
     ap.add_argument("--refresh", action="store_true",
                     help="re-check downloaded PDFs with ETag/If-Modified-Since to catch revised sheets")
@@ -2663,19 +2891,41 @@ def select_vendors(all_v: dict[str, Vendor], args) -> list[Vendor]:
 
 
 def run_parallel(fn, vendors: list[Vendor], workers: int):
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        futs = {ex.submit(fn, v): v for v in vendors}
+    """Run fn(vendor) on a few vendors at a time. Waits in 1-second steps so Ctrl-C is noticed at once
+    on Windows: the first Ctrl-C finishes the current requests and saves state (seconds, at most about a
+    minute); a second Ctrl-C quits immediately (the database stays consistent either way)."""
+    def run_one(v):
         try:
-            for fut in as_completed(futs):
+            return fn(v)
+        finally:
+            ACTIVITY.pop(threading.get_ident(), None)
+
+    ex = ThreadPoolExecutor(max_workers=max(1, workers))
+    futs = {ex.submit(run_one, v): v for v in vendors}
+    pending = set(futs)
+    try:
+        while pending:
+            done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+            for fut in done:
                 try:
                     fut.result()
                 except Exception as e:
                     log.exception("[%s] failed: %s", futs[fut].name, e)
+    except KeyboardInterrupt:
+        log.warning("Ctrl-C: finishing current requests and saving state (press Ctrl-C again to quit now)...")
+        STOP.set()
+        for f_ in pending:
+            f_.cancel()
+        try:
+            while any(not f_.done() for f_ in futs):
+                wait(list(futs), timeout=1)
         except KeyboardInterrupt:
-            log.warning("Ctrl-C: finishing current requests and saving state...")
-            STOP.set()
-            raise
-
+            log.warning("Second Ctrl-C: quitting now. Re-run the same command to continue.")
+            logging.shutdown()
+            os._exit(130)
+        raise
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
 def main(argv=None):
     args = parse_args(argv)
@@ -2683,9 +2933,11 @@ def main(argv=None):
     root.mkdir(parents=True, exist_ok=True)
     setup_logging(root, args.verbose)
     log.info("tds_crawler_v1 build %s (rules v%d) - %s", BUILD, RULES_VERSION, Path(__file__).resolve())
+    threading.Thread(target=heartbeat, daemon=True, name="heartbeat").start()
     vendors_all = load_workbook_vendors(args.workbook)
     merge_seeds(vendors_all, args.seeds)
     db = DB(root / "tds_crawler.db")
+    ensure_vendor_folders(vendors_all, root)
     chosen = select_vendors(vendors_all, args)
     allowed_status = {"ok"} if args.only_ok else {"ok", "verify"}
     active = [v for v in chosen if v.status in allowed_status and v.domains and v.start_urls]

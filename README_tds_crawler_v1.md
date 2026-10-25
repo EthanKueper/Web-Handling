@@ -15,7 +15,7 @@ The script looks for the workbook and seed file in `D:\tds_corpus\input\` (`DEFA
 
 ## Which version ran?
 
-The first log line of every run shows the build, the rules version and the full path of the script that ran, for example `tds_crawler_v1 build 2026-10-24 r14 (rules v12) - C:\...\tds_crawler_v1.py`. Browsers often save a re-downloaded file as `tds_crawler_v1 (1).py`, so check that line after replacing the script. Whenever the sorting rules change, `--classify` (or `--all`) re-checks every file automatically. A run without `--classify` warns if files were sorted by older rules.
+The first log line of every run shows the build, the rules version and the full path of the script that ran, for example `tds_crawler_v1 build 2026-10-25 r22 (rules v12) - C:\...\tds_crawler_v1.py`. Browsers often save a re-downloaded file as `tds_crawler_v1 (1).py`, so check that line after replacing the script. Whenever the sorting rules change, `--classify` (or `--all`) re-checks every file automatically. A run without `--classify` warns if files were sorted by older rules.
 
 ## Install
 
@@ -27,6 +27,12 @@ python -m pip install playwright
 ```
 
 That is all `--js` needs: the script uses Microsoft Edge or Google Chrome from your PC. `python -m playwright install chromium` is optional, and only needed if neither browser is installed. Use `python -m ...` rather than plain `pip` or `playwright`, so the package goes into the same Python that runs the script. A run with `--js` logs `JavaScript rendering: using Microsoft Edge` (or similar) when it works. If it can't start a browser, it says why and carries on without JavaScript.
+
+## Long runs: is it frozen?
+
+Every 5 minutes the log prints a "Still working" block naming what each worker is doing and for how long (a page, a PDF, a file being classified). A quiet stretch with those lines is a slow site, not a freeze; sites that ask for long pauses in robots.txt (Barmag: 60 s) are the usual cause. A single PDF download is abandoned after 5 minutes and retried on the next run, and guessed English URLs are skipped on such slow sites.
+
+Ctrl-C works at once: the first press finishes the current requests and saves state (seconds, at most about a minute); a second press quits immediately. Either way the database stays consistent, and re-running the same command continues where it stopped.
 
 ## Recommended run order (stage and validate)
 
@@ -42,6 +48,8 @@ python tds_crawler_v1.py --all --js                            # add Playwright 
 Running `--discover` on its own is the dry run: it lists every PDF link and how each was classified, without downloading anything.
 
 ## Output (default root `D:\tds_corpus`, change it with `--root`)
+
+Every vendor in the workbook gets its folder under `pdfs\<Category>\` on every run, even before anything is downloaded, so an empty folder means that vendor has no files yet (see `--status` for why).
 
 ```
 D:\tds_corpus\
@@ -97,7 +105,7 @@ Every downloaded file is read (first 6 pages). **Anything that relates to these 
 **Off-topic files are deleted** and their links are marked `deleted`, so they are never downloaded again. Each one is listed in `logs\deleted_off_topic_YYYYMMDD.csv` with its source URL. Use `--keep-off-topic` to move them to `_rejected\` instead. Off-topic means:
 
 - **Company paperwork, for every vendor:** integrated, annual and sustainability reports, management plans, balance sheets, proxy statements, codes of conduct, business principles, policies, whistleblower and ethics notices, conflict-minerals, GHG and carbon disclosures, supplier forms and portals, purchasing and sales terms, invoicing, order confirmations, claim guides, plant certificates (ISO 9001 / 14001 / 45001, IATF 16949, AS9100), chain-of-custody certificates, registration notices, licence agreements, CVs. Sales terms only count when the file *is* the terms (file name or first line), never a "see our terms and conditions" footer on a product sheet.
-- **Company paperwork by category (r14):** stock-exchange and statutory filings, purchasing / supplier paperwork (purchase conditions, supplier training and portals, Coupa / Ariba guides, contractor rules), site rules / safety / EHS notices, HR documents, compliance and position papers, and plant or chain-of-custody certificates (FSC, PEFC, FSSC 22000, ISCC...). The phrase lists are in `PAPERWORK_RULES` in the script and cover the main European languages. Filings and purchasing paperwork are matched on the name and opening text; the other categories only on the name / first lines and only when the document has few web terms, so a product sheet mentioning "ISO 9001" or a safety note stays. Product certificates (EU type-examination, declarations of performance / conformity, BBA product approvals) are kept.
+- **Company paperwork by category (r14):** stock-exchange and statutory filings, purchasing / supplier paperwork (purchase conditions, supplier training and portals, Coupa / Ariba guides, contractor rules), site rules / safety / EHS notices, HR documents, compliance and position papers, plant or chain-of-custody certificates (FSC, PEFC, FSSC 22000, ISCC, BRCGS, halal, HACCP, GMP...), and (r21) news / HR / corporate leftovers: press releases, job ads, obituaries, open-source license texts, due-diligence and anti-bribery documents, supplier-portal FAQs. The phrase lists are in `PAPERWORK_RULES` in the script and cover the main European languages. Filings and purchasing paperwork are matched on the name and opening text; the other categories only on the name / first lines and only when the document has few web terms, so a product sheet mentioning "ISO 9001" or a safety note stays. Product certificates (EU type-examination, declarations of performance / conformity, BBA product approvals) are kept.
 - **Sika: industrial only.** Kept: SikaForce, SikaPower, SikaMelt, SikaFast, SikaTack, SikaBiresin / Advanced Resins, SikaSense, SikaDamp, SikaBlock, Sika Aktivator, Sikaflex 2xx / 5xx / WS / P2G, Sika Primer 2xx, and documents about automotive, marine, appliance, composite, laminating, hot-melt or pressure-sensitive applications. Off-topic: construction product lines (Sikafloor, Sikacrete, SikaGrout, SikaTile, Sarnafil, Sikaplan, SikaProof, Sikalastic, Sikagard, SikaTop, Sikadur, Parex, LaHabra, Merkrete, Schönox, Rmax...) and anything about concrete, mortar, flooring, roofing, waterproofing, tile, stucco or facades. Sika's row in `vendor_seeds.csv` also limits the crawl to its `/en/industry` pages.
 - **Per-vendor scope** (`scope_keep` / `scope_exclude` columns in `vendor_seeds.csv`) for companies whose sites mix on- and off-topic product lines. Both are case-insensitive regexes, checked against the PDF's URL, the page it was found on, its file name and its title. An exclude match on the URL or found-on page wins (a whole site section is out), unless the keep pattern matches the file's own name or title; otherwise a keep match on the name or title keeps the file, an exclude match there removes it, and a keep match on the URL alone keeps it. Set today:
   - **Johns Manville:** nonwovens, fiberglass (chopped strands, rovings, glass mats, microfiber), filtration and OEM / aerospace insulation kept; commercial roofing and building insulation off-topic.
@@ -138,11 +146,26 @@ When a supplier's sheets are hosted on a distributor's site (Camden Copper and J
 
 **Revisions.** `--download --refresh` re-checks each downloaded PDF with ETag and If-Modified-Since. A changed sheet is saved as a new file and the old one is kept.
 
+## Document APIs (Qnity, WordPress, Dow)
+
+Some document libraries are JavaScript apps that load their file list from an API, and the files sit on another host with no `.pdf` in the URL, so crawling the pages finds nothing. The crawler reads these APIs directly at the start of `--discover`:
+
+- **Qnity Electronics** (former DuPont Electronics): the Resource Center API, for technical data sheets, product data and information sheets, technical information, brochures, overviews and application notes. Kapton, Pyralux, Oasis, Temprion, Riston and other film, laminate, flex-circuit and thermal-tape documents are kept; Kalrez seals, EKC and other semiconductor chemicals and display materials are left out (`QNITY_KEEP_TAG_RE` / `QNITY_DROP_TAG_RE` in the script). Qnity's SDSs are in a separate login-only system and aren't collected.
+
+- **WordPress sites** (Mylar, Arclin, Amut, Mitsubishi Polyester Film, Gneuss, Trexel, Meaf...): the public media-library API (`/wp-json/wp/v2/media`) lists every PDF the site has uploaded, including ones only reachable through filters or accordions. It is read for every vendor at the start of `--discover` (sites that aren't WordPress simply answer 404); `--no-wp-media` turns it off. The usual topic, paperwork and vendor-scope rules then decide what is kept.
+- **Dow:** `dow.com/documents/...pdf` links open an HTML viewer; the crawler requests them with `?iframe=true`, which returns the PDF itself.
+
+Product detail pages (`/p/d/...`, `/products/<name>`) are visited before more listing and filter pages, because that is where data-sheet links are (3M's product pages each link their Tech Data Sheet).
+
+robots.txt rules are read the way sites and Google intend (the longest matching rule wins), so `Disallow: /` plus `Allow: /api/public/` allows `/api/public/...`.
+
 ## Search seeding (optional, best for 3M / Dow / ExxonMobil)
 
 Set `SERPAPI_KEY`, or `GOOGLE_CSE_KEY` + `GOOGLE_CSE_CX`, then add `--search-seed`. For each domain the crawler queries `site:<domain> filetype:pdf ("technical data sheet" OR datasheet ...)` and adds the hits directly.
 
 ## Editing vendor_seeds.csv
+
+`max_pages` sets a page cap for one vendor that overrides `--max-pages` (set today: 3M 3000, because every product page has to be visited; Oerlikon/Barmag 20, because its robots.txt asks for 60 s between requests). Leave it empty to use `--max-pages`.
 
 | Column | Meaning |
 |---|---|
