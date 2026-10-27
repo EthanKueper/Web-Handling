@@ -85,7 +85,7 @@ and `--verify` reports which one actually matched real citations.
 | File | Contents |
 |---|---|
 | `RESULTS/forward_citations.xlsx` | One row per filtered patent — see columns below |
-| `RESULTS/forward_citation_pairs.csv` | **Authoritative, unlimited** long-format version: one row per citing/cited pair, with the citing patent's own date and that specific citation's category. Excel has hard row/cell limits a large corpus can exceed; this CSV never truncates. |
+| `RESULTS/forward_citation_pairs.csv` | **Authoritative, unlimited** long-format version: one row per citing/cited pair, with the citing patent's own date and that specific citation's category. Also carries the filtered patent's type and claim category and the citing patent's type (v5.1). Excel has hard row/cell limits a large corpus can exceed; this CSV never truncates. |
 | `RESULTS/forward_citation_match_report.csv` | Per-patent detail on how number matching resolved (from `--verify`) |
 | `DATABASE/FORWARD_CITATIONS.sqlite` | The restartable citation index itself |
 
@@ -93,6 +93,9 @@ and `--verify` reports which one actually matched real citations.
 
 | Column | Meaning |
 |---|---|
+| Patent Type | USPTO document type from the number/kind code — Utility, Design, Plant, Reissue, SIR, Defensive Publication, Application (utility/plant) |
+| Claim Category | What claim 1 claims — Process / Method, Apparatus / System, Product / Article, Composition, Product-by-process, Design, Plant (from pipeline v15.10's `--filter` or `--classify`; blank if `filtered_patents.csv` is older) |
+| Independent Claim Categories | Every category across the patent's independent claims, e.g. `Process / Method; Apparatus / System` |
 | Times Cited | Raw forward-citation count |
 | Citations Per Year | Times Cited ÷ years the patent has sat inside the corpus's *observable* window — see "Rate normalization" below |
 | Cohort Percentile | Times Cited ranked against other **filtered** patents granted in the same multi-year window — blank if the patent's date didn't parse or its cohort has too few members |
@@ -101,7 +104,15 @@ and `--verify` reports which one actually matched real citations.
 | Cited by Other/Unknown | SGML's non-examiner "other" (may or may not be applicant-sourced) plus all APS-era citations, which carry no provenance marker |
 | Citing Patent IDs | Split across multiple columns if the list would exceed Excel's ~32,767-character cell limit |
 
-Rows are sorted most-cited first. A "Run Notes" sheet records exactly what
+Rows are sorted most-cited first.
+
+**Patent type / claim category (v5.1).** The type and claim-category columns
+come straight from `filtered_patents.csv`. If that file was filtered before
+pipeline v15.10, run `uspto_patent_pipeline_v15.py --classify` once, then
+`--export` here again — no re-scan needed (Patent Type is filled from the
+number either way). The pairs sheets add Filtered Patent Type, Filtered
+Claim Category and Citing Patent Type, and Run Notes lists how many filtered
+patents fall in each claim category and how often each group was cited. A "Run Notes" sheet records exactly what
 the run covered, what coverage year was used, and all the caveats below.
 
 ## Rate normalization — what it means and what it doesn't

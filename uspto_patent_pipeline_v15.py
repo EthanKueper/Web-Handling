@@ -1,6 +1,14 @@
 """
-USPTO PATENT COLLECTION PIPELINE  (v15.9)
-=========================================
+USPTO PATENT COLLECTION PIPELINE  (v15.10)
+==========================================
+
+v15.10: filter results gain patent_type (Utility / Design /
+    Plant / Reissue / SIR / Defensive Publication /
+    Application) and claim_category (Process / Method,
+    Apparatus / System, Product / Article, Composition,
+    Product-by-process, Design, Plant) plus
+    independent_claim_categories. --classify adds them to
+    existing results without re-filtering.
 
 v15.9: PDF links for reissue (RE) and defensive publication (T)
     patents (retry with --pdf --retry-errors-only).
@@ -7291,6 +7299,548 @@ def matches_keywords(
 
 
 # ============================================================
+# PATENT TYPE + CLAIM CATEGORY  (v15.10)
+# ============================================================
+#
+# Two columns added to every filtered_patents*.csv:
+#
+#   patent_type     WHAT KIND OF DOCUMENT it is, read from the
+#                   number/kind code -- the USPTO's own types:
+#                     Utility, Design, Plant, Reissue,
+#                     Statutory Invention Registration (SIR),
+#                     Defensive Publication,
+#                     Application (utility), Application (plant)
+#
+#   claim_category  WHAT IT CLAIMS -- the statutory category of
+#                   claim 1 (35 U.S.C. 101: process, machine,
+#                   manufacture, composition of matter), read
+#                   from the claim's preamble ("A method for...",
+#                   "An apparatus for...", "A multilayer film...",
+#                   "A polymer composition..."):
+#                     Process / Method
+#                     Apparatus / System
+#                     Product / Article
+#                     Composition
+#                     Product-by-process
+#                     Design   (every design patent)
+#                     Plant    (every plant patent)
+#                     Unclassified     (claims present, preamble
+#                                       not recognized)
+#                     No claims text   (record has no claims)
+#
+#   independent_claim_categories
+#                   Every category found across ALL independent
+#                   claims, in claim order, e.g.
+#                   "Process / Method; Apparatus / System" for a
+#                   patent claiming both the method and the
+#                   machine that runs it.
+#
+# "Product vs process" is not a field USPTO records -- it is
+# read from the claim wording, so it's a well-founded heuristic,
+# not an official label. The head noun of the preamble decides
+# it ("film winding APPARATUS" -> Apparatus; "multilayer FILM"
+# -> Product). Anything it can't place is left as
+# "Unclassified" rather than guessed; the word lists below are
+# the place to extend it.
+# ------------------------------------------------------------
+
+PATENT_TYPE_UTILITY = "Utility"
+PATENT_TYPE_DESIGN = "Design"
+PATENT_TYPE_PLANT = "Plant"
+PATENT_TYPE_REISSUE = "Reissue"
+PATENT_TYPE_SIR = "Statutory Invention Registration (SIR)"
+PATENT_TYPE_DEFENSIVE = "Defensive Publication"
+PATENT_TYPE_APPLICATION = "Application (utility)"
+PATENT_TYPE_PLANT_APPLICATION = "Application (plant)"
+
+CLAIM_PROCESS = "Process / Method"
+CLAIM_APPARATUS = "Apparatus / System"
+CLAIM_PRODUCT = "Product / Article"
+CLAIM_COMPOSITION = "Composition"
+CLAIM_PRODUCT_BY_PROCESS = "Product-by-process"
+CLAIM_DESIGN = "Design"
+CLAIM_PLANT = "Plant"
+CLAIM_UNCLASSIFIED = "Unclassified"
+CLAIM_NO_TEXT = "No claims text"
+
+
+def classify_patent_type(number, document_type=None):
+
+    """
+    Patent type from the stored number / kind code. Handles
+    every format the parsers store: XML "US10123456B2",
+    "USD0707016S1", "USPP011728P2", "USRE038552E1",
+    "USH0002102H1", SGML "US06167569A", APS WKUs
+    ("US039302711", "USD02380003", "USPP0035641",
+    "USRE0374423", "USH00012345", "UST01052020"), and
+    applications "US20140123360A1".
+    """
+
+    value = (number or "").strip().upper()
+
+    if value.startswith("US"):
+        value = value[2:]
+
+    value = re.sub(r"[^A-Z0-9]", "", value)
+
+    doc_type = (document_type or "").strip().lower()
+
+    # Pre-grant application publication: 11 digits starting
+    # with a plausible year, plus a kind code (A1/A2/A9 utility,
+    # P1/P4/P9 plant).
+    application_match = re.match(r"^(\d{11})([A-Z]\d?)?$", value)
+
+    is_application = doc_type == "application" or (
+        application_match is not None
+        and 1900 <= int(value[:4]) <= 2100
+    )
+
+    if is_application:
+
+        kind = application_match.group(2) if application_match else ""
+
+        if (kind or "").startswith("P"):
+            return PATENT_TYPE_PLANT_APPLICATION
+
+        return PATENT_TYPE_APPLICATION
+
+    if value.startswith("PP"):
+        return PATENT_TYPE_PLANT
+
+    if value.startswith("RE"):
+        return PATENT_TYPE_REISSUE
+
+    if value.startswith("D"):
+        return PATENT_TYPE_DESIGN
+
+    if value.startswith("H") or doc_type == "sir":
+        return PATENT_TYPE_SIR
+
+    if value.startswith("T"):
+        return PATENT_TYPE_DEFENSIVE
+
+    if value[:1].isdigit():
+        return PATENT_TYPE_UTILITY
+
+    return ""
+
+
+# Head nouns -> category. The head noun of an English noun
+# phrase is its LAST word ("film winding apparatus" is an
+# apparatus; "apparatus for winding film" is cut at "for"
+# first), so the preamble is trimmed to its head phrase and
+# read right to left until a listed word is found.
+
+_CLAIM_PROCESS_NOUNS = {
+    "method", "process", "procedure", "use",
+}
+
+_CLAIM_COMPOSITION_NOUNS = {
+    "composition", "compound", "formulation", "blend", "mixture",
+    "alloy", "copolymer", "terpolymer", "interpolymer", "polymer",
+    "homopolymer", "resin", "adhesive", "ink", "solution",
+    "dispersion", "emulsion", "suspension", "masterbatch",
+    "concentrate", "slurry", "paste", "lubricant", "additive",
+    "catalyst", "agent", "sealant", "primer", "varnish", "lacquer",
+    "coating", "polyolefin", "polyethylene", "polypropylene",
+    "polyester", "polyamide", "polyurethane", "elastomer",
+    "rubber", "wax", "glue", "binder", "plasticizer", "stabilizer",
+    "antioxidant", "pigment", "dye", "toner", "latex", "gel",
+    "salt", "complex", "precursor", "monomer", "oligomer", "size",
+    "sizing", "furnish",
+}
+
+_CLAIM_APPARATUS_NOUNS = {
+    "apparatus", "device", "machine", "system", "assembly", "unit",
+    "mechanism", "equipment", "tool", "roller", "winder",
+    "rewinder", "unwinder", "unwind", "rewind", "dryer", "drier",
+    "die", "extruder", "press", "calender", "controller", "sensor",
+    "station", "line", "installation", "arrangement", "plant",
+    "means", "splicer", "cutter", "slitter", "knife", "blade",
+    "nozzle", "applicator", "coater", "laminator", "conveyor",
+    "guide", "mandrel", "shaft", "chuck", "spindle", "head",
+    "actuator", "motor", "frame", "module", "instrument",
+    "circuit", "computer", "processor", "drum", "belt", "pump",
+    "valve", "heater", "oven", "furnace", "reactor", "vessel",
+    "tank", "mold", "mould", "embosser", "perforator", "folder",
+    "stacker", "packer", "dispenser", "printer", "scanner",
+    "camera", "detector", "monitor", "gauge", "meter", "robot",
+    "gripper", "clamp", "holder", "bearing", "brake", "clutch",
+    "gear", "drive", "tensioner", "accumulator", "festoon",
+    "idler", "cylinder", "cartridge", "former", "headbox",
+    "wire", "manifold", "spreader", "stretcher", "tenter",
+    "orienter", "chiller", "cooler", "pelletizer", "granulator",
+    "mixer", "kneader", "blender", "pulper", "refiner", "screw",
+    "feeder", "loader", "handler", "carriage", "turret", "lathe",
+    "engine", "generator", "transducer", "emitter", "laser",
+    "source", "lamp", "electrode", "anvil", "horn", "sonotrode",
+    "welder", "sealer", "jaw", "jaws", "bar", "doctor",
+    "scraper", "wiper", "brush", "fan", "blower", "burner",
+    "network", "server", "interface", "terminal", "apparatuses",
+    "devices", "machines", "systems", "kit",
+}
+
+_CLAIM_PRODUCT_NOUNS = {
+    "film", "sheet", "laminate", "web", "fabric", "nonwoven",
+    "textile", "cloth", "paper", "paperboard", "board",
+    "cardboard", "foil", "package", "packaging", "bag", "pouch",
+    "sack", "container", "bottle", "carton", "box", "tray", "cup",
+    "lid", "wrap", "wrapper", "label", "tape", "article",
+    "product", "material", "structure", "layer", "multilayer",
+    "membrane", "fiber", "fibre", "filament", "yarn", "thread",
+    "strand", "tissue", "towel", "wipe", "diaper", "napkin", "pad",
+    "garment", "glove", "tube", "pipe", "hose", "envelope", "card",
+    "ticket", "banknote", "document", "sticker", "decal", "insert",
+    "liner", "lining", "panel", "tile", "mat", "stack", "bale",
+    "coil", "strip", "ribbon", "band", "sheeting", "substrate",
+    "composite", "foam", "sponge", "filter", "screen", "mesh",
+    "net", "netting", "capsule", "battery", "separator", "veneer",
+    "plywood", "cushion", "gasket", "closure", "cap", "medium",
+    "media", "batt", "felt", "scrim", "fleece", "wad", "wadding",
+    "absorbent", "dressing", "bandage", "mask", "gown", "drape",
+    "sleeve", "jacket", "wallpaper", "laminates", "films",
+    "sheets", "webs", "fabrics", "articles", "products", "pellet",
+    "pellets", "granule", "powder", "particle", "particles",
+    "body", "element", "member", "component", "part", "core",
+    "spool", "reel", "roll", "log", "preform", "blank",
+    "packet", "sachet", "wrapping", "covering", "cover", "skin",
+    "tarp", "tarpaulin", "geotextile", "glass", "window", "lens",
+    "display", "chip", "wafer", "laminated", "stock", "pulp",
+    "fluff", "cellulose", "nanocellulose", "microfiber",
+    "microfibers", "fibers", "fibres", "filaments", "yarns",
+}
+
+# A noun on both sides ("roll", "reel", "spool") is a PRODUCT
+# when followed by "of <material>" ("a roll of film") and an
+# APPARATUS component otherwise ("a roll for a calender").
+_CLAIM_ROLL_LIKE = {"roll", "reel", "spool", "core"}
+
+_CLAIM_NOUN_CATEGORY = {}
+
+for _noun in _CLAIM_PRODUCT_NOUNS:
+    _CLAIM_NOUN_CATEGORY[_noun] = CLAIM_PRODUCT
+
+for _noun in _CLAIM_COMPOSITION_NOUNS:
+    _CLAIM_NOUN_CATEGORY[_noun] = CLAIM_COMPOSITION
+
+for _noun in _CLAIM_APPARATUS_NOUNS:
+    _CLAIM_NOUN_CATEGORY[_noun] = CLAIM_APPARATUS
+
+for _noun in _CLAIM_PROCESS_NOUNS:
+    _CLAIM_NOUN_CATEGORY[_noun] = CLAIM_PROCESS
+
+# "roll"/"core" default to apparatus component; see above.
+_CLAIM_NOUN_CATEGORY["roll"] = CLAIM_APPARATUS
+_CLAIM_NOUN_CATEGORY["core"] = CLAIM_PRODUCT
+
+
+# Where the preamble ends and the body begins.
+_CLAIM_TRANSITION_PATTERN = re.compile(
+    r"\b(?:comprising|comprises|comprised|consisting|consists|"
+    r"including|includes|characteri[sz]ed|wherein|whereby|"
+    r"having|containing|contains|which\s+comprises)\b|[:;]",
+    re.IGNORECASE,
+)
+
+# Where the head noun phrase ends inside the preamble.
+_CLAIM_HEAD_END_PATTERN = re.compile(
+    r"\s(?:for|of|to|in|on|at|from|by|with|without|that|which|"
+    r"adapted|capable|configured|arranged|suitable|used|useful|"
+    r"made|produced|formed|obtained|obtainable|prepared|"
+    r"manufactured|being|when|where|according|as|comprising|"
+    r"intended|designed|operable|usable)\b|[,(]",
+    re.IGNORECASE,
+)
+
+_CLAIM_PRODUCT_BY_PROCESS_PATTERN = re.compile(
+    r"\b(?:made|produced|obtained|obtainable|prepared|"
+    r"manufactured|formed|produceable|producible)\s+"
+    r"(?:by|according\s+to|using|with|in\s+accordance\s+with)\s+"
+    r"(?:the|a|an)\s+(?:\w+\s+)?(?:method|process)",
+    re.IGNORECASE,
+)
+
+# Claim references that make a claim dependent.
+_CLAIM_DEPENDENT_PATTERN = re.compile(
+    r"\bclaims?\s+\d|"
+    r"\b(?:any|one)\s+(?:one\s+)?of\s+(?:the\s+)?"
+    r"(?:preceding|previous|foregoing|above|prior)\s+claims?|"
+    r"\bclaimed\s+in\s+claim",
+    re.IGNORECASE,
+)
+
+_CLAIM_ORNAMENTAL_PATTERN = re.compile(
+    r"\bornamental\s+design\b", re.IGNORECASE
+)
+
+
+def _claim_number_pattern(number):
+
+    # "<n>." or "<n>)" at the start of the text or after
+    # whitespace / punctuation (XML can glue "...film.2. The"),
+    # followed by the start of a sentence. Leading zeros and a
+    # reissue bracket ("[2. ...") are allowed.
+    return re.compile(
+        r"(?:^|(?<=[\s.;:,)\]\[]))0*" + str(number)
+        + r"\s*[.)]\s*(?=[\[\"'(]?[A-Z])"
+    )
+
+
+def split_claims(claims_text, max_claims=300):
+
+    """
+    Splits a flattened claims blob into individual claims by
+    walking the claim numbers in order (1, 2, 3 ...) -- each
+    number is only accepted after the previous one, which keeps
+    "claim 2" references or stray numbers from splitting a
+    claim. Returns a list of claim strings (number removed).
+    If claim 1 can't be found, the whole text comes back as a
+    single claim.
+    """
+
+    text = (claims_text or "").strip()
+
+    if not text:
+        return []
+
+    first = _claim_number_pattern(1).search(text, 0, 800)
+
+    if first is None:
+
+        # No visible numbering. Drop a "What is claimed is:"
+        # style heading if there is one and treat the rest as
+        # one claim -- claim 1 still leads, which is what the
+        # primary category needs.
+        heading = re.match(
+            r"^[^:]{0,120}\bclaim(?:ed|s)?\b[^:]{0,40}:\s*",
+            text,
+            re.IGNORECASE,
+        )
+
+        return [text[heading.end():] if heading else text]
+
+    starts = [(first.start(), first.end())]
+
+    position = first.end()
+
+    for number in range(2, max_claims + 1):
+
+        match = _claim_number_pattern(number).search(text, position)
+
+        if match is None:
+            break
+
+        starts.append((match.start(), match.end()))
+
+        position = match.end()
+
+    claims = []
+
+    for index, (start, body_start) in enumerate(starts):
+
+        end = starts[index + 1][0] if index + 1 < len(starts) else len(text)
+
+        body = text[body_start:end].strip()
+
+        # Reissue: a cancelled claim is bracketed "[2. ...]", and
+        # the "[" sits just before its number.
+        if start > 0 and text[start - 1] == "[":
+            body = "[" + body
+
+        claims.append(body)
+
+    return claims
+
+
+def _is_dependent_claim(claim):
+
+    return bool(_CLAIM_DEPENDENT_PATTERN.search(claim[:300]))
+
+
+def _is_cancelled_claim(claim):
+
+    stripped = claim.strip()
+
+    return (
+        stripped.startswith("[")
+        or re.match(r"^\(?\s*(?:canceled|cancelled|deleted)\b", stripped, re.IGNORECASE)
+        is not None
+    )
+
+
+def categorize_claim(claim):
+
+    """Statutory category of one claim, from its preamble."""
+
+    text = claim.strip().lstrip("[\"'( ").strip()
+
+    if not text:
+        return CLAIM_UNCLASSIFIED
+
+    if _CLAIM_ORNAMENTAL_PATTERN.search(text[:200]):
+        return CLAIM_DESIGN
+
+    transition = _CLAIM_TRANSITION_PATTERN.search(text)
+
+    preamble = text[:transition.start()] if transition else text[:250]
+
+    preamble = preamble[:250].strip()
+
+    lowered = preamble.lower()
+
+    # Jepson form "In a ..., the improvement" and leading
+    # articles / adjectives that carry no category.
+    lowered = re.sub(r"^(?:in\s+)?(?:an?|the|one\s+or\s+more)\s+", "", lowered)
+    lowered = re.sub(r"^(?:improved|new|novel)\s+", "", lowered)
+
+    head_end = _CLAIM_HEAD_END_PATTERN.search(lowered)
+
+    head = lowered[:head_end.start()] if head_end else lowered
+
+    after_head = lowered[head_end.start():] if head_end else ""
+
+    words = re.findall(r"[a-z][a-z\-]*", head)
+
+    category = None
+
+    for word in reversed(words):
+
+        # "film-forming apparatus" -> "apparatus";
+        # "cross-machine" -> "machine".
+        candidates = [word, word.split("-")[-1]]
+
+        for candidate in list(candidates):
+            if candidate.endswith("es"):
+                candidates.append(candidate[:-2])
+            if candidate.endswith("s"):
+                candidates.append(candidate[:-1])
+
+        for candidate in candidates:
+
+            if candidate in _CLAIM_NOUN_CATEGORY:
+
+                category = _CLAIM_NOUN_CATEGORY[candidate]
+
+                if (
+                    candidate in _CLAIM_ROLL_LIKE
+                    and re.match(r"\s*of\b", after_head)
+                ):
+                    category = CLAIM_PRODUCT
+
+                break
+
+        if category:
+            break
+
+    if category is None:
+
+        # Nothing in the head phrase -- a method/process word
+        # anywhere in the preamble still settles it
+        # ("A computer implemented technique-based method").
+        if re.search(r"\b(?:method|process)\b", lowered):
+            category = CLAIM_PROCESS
+        else:
+            return CLAIM_UNCLASSIFIED
+
+    if (
+        category in (CLAIM_PRODUCT, CLAIM_COMPOSITION)
+        and _CLAIM_PRODUCT_BY_PROCESS_PATTERN.search(preamble)
+    ):
+        return CLAIM_PRODUCT_BY_PROCESS
+
+    return category
+
+
+def classify_claims(claims_text, patent_type=""):
+
+    """
+    Returns (claim_category, independent_claim_categories).
+
+    claim_category is claim 1's category; the second value lists
+    every distinct category among the independent claims, in
+    order, joined with "; ".
+    """
+
+    if patent_type == PATENT_TYPE_DESIGN:
+        return CLAIM_DESIGN, CLAIM_DESIGN
+
+    if patent_type in (PATENT_TYPE_PLANT, PATENT_TYPE_PLANT_APPLICATION):
+        return CLAIM_PLANT, CLAIM_PLANT
+
+    claims = split_claims(claims_text)
+
+    if not claims:
+        return CLAIM_NO_TEXT, ""
+
+    categories = [categorize_claim(claim) for claim in claims]
+
+    found = []
+
+    primary = None
+
+    for index, claim in enumerate(claims):
+
+        if _is_cancelled_claim(claim):
+            continue
+
+        category = categories[index]
+
+        if _is_dependent_claim(claim):
+
+            # A claim that refers back but starts "A ..."/"An ..."
+            # in a DIFFERENT category is a new independent claim
+            # in all but form ("An apparatus for carrying out the
+            # method of claim 1", "A film made by the process of
+            # claim 1"). Counted; a plain dependent is not.
+            reference = re.search(r"\bclaims?\s+(\d+)", claim[:300], re.IGNORECASE)
+
+            starts_new = re.match(r"^[\[\"'(]?\s*an?\s", claim, re.IGNORECASE)
+
+            referenced = int(reference.group(1)) - 1 if reference else None
+
+            if not (
+                starts_new
+                and referenced is not None
+                and 0 <= referenced < len(categories)
+                and categories[referenced] != category
+                and category != CLAIM_UNCLASSIFIED
+            ):
+                continue
+
+        if primary is None:
+            primary = category
+
+        if category not in found:
+            found.append(category)
+
+    if primary is None:
+
+        # Every claim looked dependent/cancelled (e.g. a reissue
+        # whose original claims are all bracketed) -- fall back
+        # to the first claim as written.
+        primary = categories[0]
+        found = [primary]
+
+    # Put real categories ahead of "Unclassified" in the list.
+    found.sort(key=lambda item: item == CLAIM_UNCLASSIFIED)
+
+    return primary, "; ".join(found)
+
+
+def classify_patent(number, document_type, claims_text):
+
+    """(patent_type, claim_category, independent_claim_categories)"""
+
+    patent_type = classify_patent_type(number, document_type)
+
+    claim_category, all_categories = classify_claims(
+        _decompress_text(claims_text), patent_type
+    )
+
+    return patent_type, claim_category, all_categories
+
+
+# ============================================================
 # FILTER DATABASE
 # ============================================================
 
@@ -7298,6 +7848,9 @@ FILTER_OUTPUT_FIELDS = [
     "patent_number",
     "publication_number",
     "document_type",
+    "patent_type",
+    "claim_category",
+    "independent_claim_categories",
     "title",
     "inventors",
     "applicants",
@@ -7390,10 +7943,19 @@ def _filter_one_product(product, db_path):
                 if not matches_keywords(title, abstract, claims, description):
                     continue
 
+                patent_type, claim_category, all_categories = classify_patent(
+                    patent_number or publication_number,
+                    document_type,
+                    claims,
+                )
+
                 writer.writerow({
                     "patent_number": patent_number,
                     "publication_number": publication_number,
                     "document_type": document_type,
+                    "patent_type": patent_type,
+                    "claim_category": claim_category,
+                    "independent_claim_categories": all_categories,
                     "title": title,
                     "inventors": inventors,
                     "applicants": applicants,
@@ -7464,6 +8026,135 @@ def _combine_filter_results():
     os.replace(temp_path, FILTER_RESULTS)
 
     return total, included, missing
+
+
+def classify_filter_results(product_format=None):
+
+    """
+    --classify: adds/refreshes patent_type, claim_category and
+    independent_claim_categories in filter results that ALREADY
+    exist, without re-running the filter. Each row's claims are
+    looked up in its product database by publication_number
+    (indexed), so this touches only the filtered patents and
+    takes minutes, not the hours a full --filter does.
+
+    --classify                 every filtered_patents_<product>.csv
+    --classify --format xml    just one
+
+    filtered_patents.csv is rebuilt afterwards, so the forward-
+    citations script and --pdf pick the columns up too.
+    """
+
+    print()
+    print("=" * 80)
+    print("CLASSIFYING FILTERED PATENTS (patent type + claim category)")
+    print("=" * 80)
+
+    if product_format is not None and product_format not in DATABASE_FILES:
+
+        print(
+            f"  Unknown --format '{product_format}'. Choose from: "
+            f"{', '.join(DATABASE_FILES)}."
+        )
+
+        return
+
+    products = [product_format] if product_format else DATABASE_PRODUCT_ORDER
+
+    classified_any = False
+
+    for product in products:
+
+        results_path = _product_filter_results_path(product)
+
+        db_path = DATABASE_FILES[product]
+
+        if not results_path.exists():
+
+            print(f"  {product}: no {results_path.name} yet -- run --filter first.")
+
+            continue
+
+        if not db_path.exists():
+
+            print(f"  {product}: database {db_path.name} not found -- skipping.")
+
+            continue
+
+        with open(results_path, "r", newline="", encoding="utf-8-sig") as input_file:
+
+            rows = list(csv.DictReader(input_file))
+
+        connection = get_db_connection(db_path)
+
+        temp_path = results_path.with_suffix(".tmp")
+
+        counts = {}
+
+        missing_claims = 0
+
+        try:
+
+            with open(temp_path, "w", newline="", encoding="utf-8-sig") as output_file:
+
+                writer = csv.DictWriter(output_file, fieldnames=FILTER_OUTPUT_FIELDS)
+
+                writer.writeheader()
+
+                for row in tqdm(rows, desc=f"Classifying {product}", unit="patent"):
+
+                    text_row = connection.execute(
+                        "SELECT t.claims FROM patents p "
+                        "JOIN patent_text t ON t.id = p.id "
+                        "WHERE p.publication_number = ?",
+                        (row.get("publication_number"),),
+                    ).fetchone()
+
+                    if text_row is None:
+                        missing_claims += 1
+
+                    patent_type, claim_category, all_categories = classify_patent(
+                        row.get("patent_number") or row.get("publication_number"),
+                        row.get("document_type"),
+                        text_row[0] if text_row else None,
+                    )
+
+                    row["patent_type"] = patent_type
+                    row["claim_category"] = claim_category
+                    row["independent_claim_categories"] = all_categories
+
+                    counts[claim_category] = counts.get(claim_category, 0) + 1
+
+                    writer.writerow({field: row.get(field, "") for field in FILTER_OUTPUT_FIELDS})
+
+        finally:
+
+            connection.close()
+
+        os.replace(temp_path, results_path)
+
+        classified_any = True
+
+        print(f"  {product}: {len(rows):,} patents classified  ->  {results_path.name}")
+
+        for category, count in sorted(counts.items(), key=lambda item: -item[1]):
+            print(f"      {category:<24}{count:>12,}")
+
+        if missing_claims:
+            print(
+                f"      ({missing_claims:,} rows not found in {db_path.name} -- "
+                f"patent type is still set from the number)"
+            )
+
+    if not classified_any:
+
+        return
+
+    total, included, _missing = _combine_filter_results()
+
+    print()
+    print(f"Combined results ({', '.join(included)}): {total:,} patents")
+    print(FILTER_RESULTS)
 
 
 def filter_patents(product_format=None):
@@ -9199,6 +9890,20 @@ def main():
 
     parser.add_argument(
 
+        "--classify",
+
+        action="store_true",
+
+        help=
+            "Add patent type + claim category columns to existing "
+            "filter results without re-filtering (--format to do "
+            "one product)"
+
+    )
+
+
+    parser.add_argument(
+
         "--pdf",
 
         action="store_true",
@@ -9337,6 +10042,11 @@ def main():
     if args.filter:
 
         filter_patents(product_format=args.format)
+
+
+    if args.classify:
+
+        classify_filter_results(product_format=args.format)
 
 
     if args.pdf:

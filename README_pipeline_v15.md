@@ -122,7 +122,7 @@ incomplete `filtered_patents.csv` you'd need to redo later.
 
 | File | Contents |
 |---|---|
-| `RESULTS/filtered_patents.csv` | The patents that matched both CPC and keyword — patent number, title, dates, CPC/IPC, inventors, assignees, source path |
+| `RESULTS/filtered_patents.csv` | The patents that matched both CPC and keyword — patent number, patent type, claim category, title, dates, CPC/IPC, inventors, assignees, source path |
 | `PDF/GRANTS/`, `PDF/APPLICATIONS/`, `PDF/OTHER/` | Downloaded PDFs, split by document type |
 | `RESULTS/filtered_patents_<product>.csv` | Per-product filter results (`aps`, `sgml`, `xml`, `appxml`), merged into `filtered_patents.csv` |
 | `DATABASE/USPTO_APS.sqlite`, `USPTO_SGML.sqlite`, `USPTO_XML_GRANTS.sqlite`, `USPTO_APPLICATIONS.sqlite` | The full parsed corpus, one file per product (not just filtered matches) |
@@ -281,6 +281,47 @@ python uspto_patent_pipeline_v15.py --pdf --retry-errors-only
   `--pdf --retry-errors-only` (add `--format`/`--limit` as usual).
 - The PDF manifest is shared, so anything already `COMPLETE` is skipped no
   matter which section requests it.
+
+## Patent type and claim category (v15.10)
+
+Every filter results file carries three classification columns, right after
+`document_type`:
+
+| Column | Where it comes from | Values |
+|---|---|---|
+| `patent_type` | The number / kind code (official USPTO document types) | Utility, Design, Plant, Reissue, Statutory Invention Registration (SIR), Defensive Publication, Application (utility), Application (plant) |
+| `claim_category` | Claim 1's preamble — the statutory category of what's claimed (35 U.S.C. 101) | Process / Method, Apparatus / System, Product / Article, Composition, Product-by-process, Design, Plant, Unclassified, No claims text |
+| `independent_claim_categories` | Every category found across all independent claims, in claim order | e.g. `Process / Method; Apparatus / System` for a patent claiming both the method and the machine |
+
+`patent_type` is exact. `claim_category` is read from the claim wording, since
+USPTO doesn't record "product vs process" as a field: the head noun of the
+preamble decides it ("A film winding **apparatus**…" → Apparatus / System,
+"A multilayer **film**…" → Product / Article, "A **method** of…" →
+Process / Method, "A polyethylene **composition**…" → Composition; "…obtained
+by the process of…" → Product-by-process). A preamble it can't place is left
+`Unclassified` rather than guessed — the word lists in the "PATENT TYPE +
+CLAIM CATEGORY" section of the script are where to extend it. A claim that
+refers back to another claim but opens a new category ("An apparatus for
+carrying out the method of claim 1") counts as independent; plain dependent
+claims and bracketed (cancelled) reissue claims don't.
+
+New `--filter` runs fill the columns automatically. To add them to results
+you've **already** filtered without re-running the filter:
+
+```
+python uspto_patent_pipeline_v15.py --classify
+python uspto_patent_pipeline_v15.py --classify --format xml
+```
+
+`--classify` looks each filtered patent's claims up in its product database
+(by `publication_number`, which is indexed), rewrites
+`filtered_patents_<product>.csv`, rebuilds `filtered_patents.csv`, and prints
+a count per category. It only touches the filtered patents, so it takes
+minutes rather than a full filter pass. Run it before the forward-citations
+`--export` so those columns carry through to `forward_citations.xlsx`.
+
+Design patents rarely show up in the filter results at all — they carry no
+CPC/IPC (see Known gaps) — so expect `Design` to be uncommon.
 
 ## `--filter` performance
 
