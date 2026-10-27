@@ -2,7 +2,8 @@
 USPTO FORWARD-CITATION CROSS-REFERENCE  (v5.1)
 ==============================================
 
-v5.1: patent type and claim category. The Forward Citations
+v5.1: reads RESULTS/FILTERED\filtered_patents.csv and writes to
+    RESULTS/FORWARD CITATIONS. Patent type and claim category. The Forward Citations
     sheet gains Patent Type, Claim Category and Independent
     Claim Categories (carried over from filtered_patents.csv --
     pipeline v15.10's --filter or --classify fills them). The
@@ -382,18 +383,24 @@ RESULTS_DIR = BULK_DATA_ROOT_DIR / "RESULTS"
 LOG_DIR = BULK_DATA_ROOT_DIR / "LOGS"
 
 
-FILTER_RESULTS = RESULTS_DIR / "filtered_patents.csv"
+# The main pipeline's --filter output (RESULTS\FILTERED) and
+# this script's output (RESULTS\FORWARD CITATIONS).
+FILTER_RESULTS_DIR = RESULTS_DIR / "FILTERED"
+
+FORWARD_CITATIONS_DIR = RESULTS_DIR / "FORWARD CITATIONS"
+
+FILTER_RESULTS = FILTER_RESULTS_DIR / "filtered_patents.csv"
 
 CITATION_INDEX_DB = DATABASE_DIR / "FORWARD_CITATIONS.sqlite"
 
-FORWARD_CITATION_XLSX = RESULTS_DIR / "forward_citations.xlsx"
+FORWARD_CITATION_XLSX = FORWARD_CITATIONS_DIR / "forward_citations.xlsx"
 
 FORWARD_CITATION_PAIRS_CSV = (
-    RESULTS_DIR / "forward_citation_pairs.csv"
+    FORWARD_CITATIONS_DIR / "forward_citation_pairs.csv"
 )
 
 FORWARD_CITATION_VERIFY_CSV = (
-    RESULTS_DIR / "forward_citation_match_report.csv"
+    FORWARD_CITATIONS_DIR / "forward_citation_match_report.csv"
 )
 
 
@@ -2401,7 +2408,7 @@ def export_results():
     # LONG-FORMAT CSV  (authoritative, unlimited)
     # --------------------------------------------------------
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    FORWARD_CITATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
     pair_count = 0
 
@@ -2419,7 +2426,7 @@ def export_results():
 
     # Remove per-section files from an earlier export first, so a
     # stale "_part3" from a bigger previous run can't linger.
-    for old_file in RESULTS_DIR.glob(
+    for old_file in FORWARD_CITATIONS_DIR.glob(
         FORWARD_CITATION_PAIRS_CSV.stem + "_*" + FORWARD_CITATION_PAIRS_CSV.suffix
     ):
         try:
@@ -3092,6 +3099,8 @@ def verify():
     both_hits = 0
     no_hits = 0
     ambiguous = []
+
+    FORWARD_CITATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
     with open(
         FORWARD_CITATION_VERIFY_CSV,

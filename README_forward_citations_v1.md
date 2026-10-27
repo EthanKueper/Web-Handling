@@ -84,9 +84,9 @@ and `--verify` reports which one actually matched real citations.
 
 | File | Contents |
 |---|---|
-| `RESULTS/forward_citations.xlsx` | One row per filtered patent — see columns below |
-| `RESULTS/forward_citation_pairs.csv` | **Authoritative, unlimited** long-format version: one row per citing/cited pair, with the citing patent's own date and that specific citation's category. Also carries the filtered patent's type and claim category and the citing patent's type (v5.1). Excel has hard row/cell limits a large corpus can exceed; this CSV never truncates. |
-| `RESULTS/forward_citation_match_report.csv` | Per-patent detail on how number matching resolved (from `--verify`) |
+| `RESULTS/FORWARD CITATIONS/forward_citations.xlsx` | One row per filtered patent — see columns below |
+| `RESULTS/FORWARD CITATIONS/forward_citation_pairs.csv` | **Authoritative, unlimited** long-format version: one row per citing/cited pair, with the citing patent's own date and that specific citation's category. Also carries the filtered patent's type and claim category and the citing patent's type (v5.1). Excel has hard row/cell limits a large corpus can exceed; this CSV never truncates. |
+| `RESULTS/FORWARD CITATIONS/forward_citation_match_report.csv` | Per-patent detail on how number matching resolved (from `--verify`) |
 | `DATABASE/FORWARD_CITATIONS.sqlite` | The restartable citation index itself |
 
 ### `forward_citations.xlsx` columns

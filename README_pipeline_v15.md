@@ -122,9 +122,9 @@ incomplete `filtered_patents.csv` you'd need to redo later.
 
 | File | Contents |
 |---|---|
-| `RESULTS/filtered_patents.csv` | The patents that matched both CPC and keyword — patent number, patent type, claim category, title, dates, CPC/IPC, inventors, assignees, source path |
+| `RESULTS/FILTERED/filtered_patents.csv` | The patents that matched both CPC and keyword — patent number, patent type, claim category, title, dates, CPC/IPC, inventors, assignees, source path |
 | `PDF/GRANTS/`, `PDF/APPLICATIONS/`, `PDF/OTHER/` | Downloaded PDFs, split by document type |
-| `RESULTS/filtered_patents_<product>.csv` | Per-product filter results (`aps`, `sgml`, `xml`, `appxml`), merged into `filtered_patents.csv` |
+| `RESULTS/FILTERED/filtered_patents_<product>.csv` | Per-product filter results (`aps`, `sgml`, `xml`, `appxml`), merged into `filtered_patents.csv` |
 | `DATABASE/USPTO_APS.sqlite`, `USPTO_SGML.sqlite`, `USPTO_XML_GRANTS.sqlite`, `USPTO_APPLICATIONS.sqlite` | The full parsed corpus, one file per product (not just filtered matches) |
 | `MANIFEST/download_manifest.csv`, `MANIFEST/database_manifest.csv`, `MANIFEST/pdf_manifest.csv` | Restart bookkeeping — what's already been downloaded/parsed/fetched, and why anything failed |
 | `LOGS/pipeline.log` | Full run log |
@@ -254,8 +254,8 @@ python uspto_patent_pipeline_v15.py --filter --format xml
 python uspto_patent_pipeline_v15.py --filter --format appxml
 ```
 
-Each section writes `RESULTS/filtered_patents_<product>.csv`, and after every
-run `RESULTS/filtered_patents.csv` (what `--pdf` and the forward-citations
+Each section writes `RESULTS/FILTERED/filtered_patents_<product>.csv`, and after every
+run `RESULTS/FILTERED/filtered_patents.csv` (what `--pdf` and the forward-citations
 script read) is rebuilt from all the per-product files filtered so far. A
 plain `--filter` still does all four in one go. Re-running a section replaces
 only that section's results. If you change the CPC/keyword workbooks partway

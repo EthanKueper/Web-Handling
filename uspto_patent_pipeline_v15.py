@@ -2,7 +2,8 @@
 USPTO PATENT COLLECTION PIPELINE  (v15.10)
 ==========================================
 
-v15.10: filter results gain patent_type (Utility / Design /
+v15.10: filter results read/written in RESULTS/FILTERED.
+    Also: filter results gain patent_type (Utility / Design /
     Plant / Reissue / SIR / Defensive Publication /
     Application) and claim_category (Process / Method,
     Apparatus / System, Product / Article, Composition,
@@ -987,8 +988,12 @@ PDF_MANIFEST = (
     "pdf_manifest.csv"
 )
 
+# Filter results live in RESULTS\FILTERED (forward-citation
+# output goes to RESULTS\FORWARD CITATIONS -- see that script).
+FILTER_RESULTS_DIR = RESULTS_DIR / "FILTERED"
+
 FILTER_RESULTS = (
-    RESULTS_DIR /
+    FILTER_RESULTS_DIR /
     "filtered_patents.csv"
 )
 
@@ -1042,6 +1047,8 @@ for directory in [
     PDF_OTHER_DIR,
 
     RESULTS_DIR,
+
+    FILTER_RESULTS_DIR,
 
     MANIFEST_DIR,
 
