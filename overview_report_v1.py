@@ -24,12 +24,21 @@ overview_report.xlsx sheets:
               category; bar chart: patents by claim category; bar
               chart: patents by file type (APS / SGML / XML grants /
               Applications); table: top 10 patents by forward
-              citations
+              citations; line chart: patents per year (grants vs
+              applications); top 15 CPC subclasses
+    Citations forward-citation distribution, top 10 by citations
+              per year, average citations by claim category, and
+              what kinds of documents cite the filtered patents
     Crawl     vendor data-sheet crawl: headline numbers; charts of
               documents by material category, by document type,
-              top 15 vendors, and test-method families
+              top 15 vendors, test-method families and language;
+              material category x document type table; vendors with
+              no kept documents and why
     Vendors   one row per vendor: pages crawled, PDF links found,
               documents kept by type, translations, rejected, size
+    Vendors & Patents
+              data-sheet vendors matched to patent assignees: patents,
+              citations and data sheets side by side
     Notes     what was read, when, and how the numbers were counted
 
 Reads only -- nothing in D:\\uspto_corpus or D:\\tds_corpus is
@@ -54,7 +63,7 @@ from datetime import datetime
 from pathlib import Path
 
 import openpyxl
-from openpyxl.chart import BarChart, Reference
+from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -119,6 +128,161 @@ DOC_TYPE_LABEL = {
     "other": "Technical document",
     "unreadable": "Scanned / image-only PDF",
 }
+
+
+# Short titles for the CPC/IPC subclasses most likely to appear
+# in a web-handling / films / nonwovens / foil / paper corpus.
+# A subclass not listed here is still counted -- its title cell
+# is just left blank.
+CPC_SUBCLASS_TITLES = {
+    "A41D": "Outerwear; protective garments",
+    "A47K": "Sanitary equipment; toilet accessories",
+    "A47L": "Domestic washing or cleaning",
+    "A61B": "Diagnosis; surgery",
+    "A61F": "Absorbent articles, bandages, diapers; prostheses",
+    "A61K": "Medical, dental or toiletry preparations",
+    "A61L": "Sterilising; materials for dressings and absorbent pads",
+    "A61M": "Devices for introducing media into the body",
+    "B01D": "Separation; filtration",
+    "B01J": "Chemical or physical processes; catalysis",
+    "B05B": "Spraying apparatus; nozzles",
+    "B05C": "Apparatus for applying liquids to surfaces (coaters)",
+    "B05D": "Processes for applying liquids to surfaces (coating)",
+    "B08B": "Cleaning in general",
+    "B21B": "Rolling of metal",
+    "B21C": "Making metal sheet, wire, rods, tubes (non-rolling)",
+    "B21D": "Working sheet metal",
+    "B22F": "Working metallic powder",
+    "B23K": "Soldering, welding, cladding",
+    "B26D": "Cutting; perforating; punching",
+    "B26F": "Perforating, punching, cutting-out by other means",
+    "B27N": "Articles from wood particles or fibres",
+    "B29B": "Preparing plastics (pellets, preforms)",
+    "B29C": "Shaping or joining plastics (extrusion, moulding, stretching)",
+    "B29D": "Producing particular articles from plastics",
+    "B29K": "Plastics materials (indexing)",
+    "B29L": "Plastics articles (indexing)",
+    "B30B": "Presses",
+    "B31B": "Making paper or cardboard containers",
+    "B31C": "Making wound paper articles (tubes)",
+    "B31D": "Making other paper articles",
+    "B31F": "Working paper (creping, embossing, corrugating)",
+    "B32B": "Layered products (laminates)",
+    "B41F": "Printing machines",
+    "B41J": "Selective printing mechanisms (inkjet)",
+    "B41M": "Printing, duplicating, marking processes",
+    "B41N": "Printing plates and blankets",
+    "B42D": "Books; security documents and cards",
+    "B44C": "Decorative effects; decalcomania",
+    "B65B": "Packaging machines and methods",
+    "B65C": "Labelling machines",
+    "B65D": "Containers, packaging elements, packages",
+    "B65G": "Conveying; storage",
+    "B65H": "Handling webs, sheets and filaments (winding, unwinding)",
+    "B82Y": "Nanotechnology",
+    "C01B": "Non-metallic elements and compounds",
+    "C03C": "Glass composition; glass surface treatment",
+    "C08B": "Polysaccharides; cellulose derivatives",
+    "C08C": "Rubber treatment",
+    "C08F": "Addition polymers (polyolefins, acrylics)",
+    "C08G": "Condensation polymers (polyesters, polyamides, PU)",
+    "C08H": "Derivatives of natural polymers",
+    "C08J": "Working-up of polymers (films, foams, compounding)",
+    "C08K": "Polymer additives and fillers",
+    "C08L": "Polymer compositions",
+    "C09B": "Organic dyes",
+    "C09C": "Pigments and fillers (treatment)",
+    "C09D": "Coating compositions; inks; varnishes",
+    "C09J": "Adhesives",
+    "C09K": "Materials for miscellaneous applications",
+    "C11D": "Detergents",
+    "C22C": "Alloys",
+    "C22F": "Heat treatment of non-ferrous metals and alloys",
+    "C23C": "Coating metals; vapour deposition",
+    "C25D": "Electroplating; electrolytic coating",
+    "D01D": "Making artificial filaments (spinning apparatus)",
+    "D01F": "Artificial filaments (chemical features)",
+    "D02G": "Crimping fibres; yarns",
+    "D02J": "Finishing filaments and yarns",
+    "D03D": "Woven fabrics; weaving",
+    "D04B": "Knitting",
+    "D04H": "Nonwoven fabrics",
+    "D06B": "Treating textiles with liquids or gases",
+    "D06C": "Finishing and stretching textile fabrics",
+    "D06M": "Chemical treatment of fibres and fabrics",
+    "D06N": "Coated textile coverings (floor, wall)",
+    "D06P": "Dyeing or printing textiles",
+    "D21B": "Fibrous raw materials for paper",
+    "D21C": "Pulp production",
+    "D21D": "Stock preparation before the paper machine",
+    "D21F": "Paper-making machines and methods",
+    "D21G": "Calenders; paper-machine accessories",
+    "D21H": "Paper compositions, coating and impregnation",
+    "D21J": "Fibreboard; moulded pulp",
+    "F16C": "Shafts; bearings",
+    "F16L": "Pipes and hoses",
+    "F26B": "Drying",
+    "G01B": "Measuring length, thickness, area",
+    "G01N": "Analysing materials (testing, inspection)",
+    "G03F": "Photolithography",
+    "G05B": "Control systems",
+    "G06F": "Digital data processing",
+    "G06T": "Image processing",
+    "H01B": "Cables; conductors; insulators",
+    "H01G": "Capacitors",
+    "H01L": "Semiconductor devices",
+    "H01M": "Batteries; fuel cells (incl. separators, foils)",
+    "H05K": "Printed circuits",
+    "Y10T": "Former US classification cross-reference art",
+}
+
+TOP_N_CPC = 15
+
+# Forward-citation rate: same floor as the forward-citations
+# script (a patent granted last year isn't divided by ~0), and a
+# minimum count so a patent with 3 citations in its first year
+# doesn't top the "fastest-cited" table.
+CITATION_RATE_MIN_YEARS = 1.0
+CITATION_RATE_MIN_CITES = 10
+
+CITATION_BUCKETS = [
+    ("0", 0, 0),
+    ("1-5", 1, 5),
+    ("6-20", 6, 20),
+    ("21-100", 21, 100),
+    ("101-500", 101, 500),
+    ("Over 500", 501, None),
+]
+
+
+def classify_patent_type(number):
+
+    """Utility / Design / Plant / Reissue / SIR / Defensive
+    Publication / Application, from the number (same rules as the
+    pipeline's classify_patent_type)."""
+
+    value = re.sub(r"[^A-Z0-9]", "", (number or "").strip().upper())
+
+    if value.startswith("US"):
+        value = value[2:]
+
+    application = re.match(r"^(\d{11})([A-Z]\d?)?$", value)
+
+    if application and 1900 <= int(value[:4]) <= 2100:
+        return "Application (plant)" if (application.group(2) or "").startswith("P") else "Application (utility)"
+    if value.startswith("PP"):
+        return "Plant"
+    if value.startswith("RE"):
+        return "Reissue"
+    if value.startswith("D"):
+        return "Design"
+    if value.startswith("H"):
+        return "Statutory Invention Registration (SIR)"
+    if value.startswith("T"):
+        return "Defensive Publication"
+    if value[:1].isdigit():
+        return "Utility"
+    return "Unknown"
 
 
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
@@ -264,6 +428,28 @@ def _grant_key(number, product):
     return f"{prefix}{digits.lstrip('0') or '0'}"
 
 
+def _subclasses(cpc, ipc):
+
+    """Distinct 4-character subclasses (e.g. B65H) from the CPC
+    codes, falling back to IPC for records without CPC (pre-2013),
+    the same fallback the filter uses."""
+
+    found = []
+
+    for code in re.split(r"[;,]", cpc or "") or []:
+        match = re.match(r"\s*([A-HY]\d{2}[A-Z])", code.upper())
+        if match and match.group(1) not in found:
+            found.append(match.group(1))
+
+    if not found:
+        for code in re.split(r"[;,]", ipc or ""):
+            match = re.match(r"\s*([A-H]\d{2}[A-Z])", code.upper())
+            if match and match.group(1) not in found:
+                found.append(match.group(1))
+
+    return tuple(found)
+
+
 def load_filtered_patents():
 
     """
@@ -323,6 +509,8 @@ def load_filtered_patents():
                     ),
                     "patent_type": (row.get("patent_type") or "").strip(),
                     "claim_category": (row.get("claim_category") or "").strip() or NOT_CLASSIFIED,
+                    "is_application": product == "appxml",
+                    "subclasses": _subclasses(row.get("cpc"), row.get("ipc")),
                 }
 
         file_counts.append((label, count))
@@ -339,6 +527,13 @@ def load_forward_citation_counts():
     (one row per unique citing/cited pair). Uses the combined
     forward_citation_pairs.csv, or the per-section files if the
     combined one isn't there.
+
+    Returns a dict:
+        totals         Counter  filtered patent -> times cited
+        by_category    {patent: Counter(applicant/examiner/...)}
+        citing_types   Counter  type -> distinct citing documents
+        coverage_year  latest citing-patent year seen
+        files          names of the files read
     """
 
     combined = FORWARD_DIR / "forward_citation_pairs.csv"
@@ -350,6 +545,9 @@ def load_forward_citation_counts():
 
     totals = Counter()
     by_category = defaultdict(Counter)
+    citing_seen = set()
+    citing_types = Counter()
+    coverage_year = None
 
     for path in files:
 
@@ -365,32 +563,107 @@ def load_forward_citation_counts():
             except ValueError:
                 continue
 
-            category_col = (
-                header.index("citation_category")
-                if "citation_category" in header
-                else None
-            )
+            def column(name):
+                return header.index(name) if name in header else None
+
+            category_col = column("citation_category")
+            citing_col = column("citing_patent_number")
+            citing_type_col = column("citing_patent_type")
+            citing_date_col = column("citing_patent_date")
+
+            width = len(header)
 
             for row in reader:
 
-                if len(row) <= cited_col:
+                if len(row) < width:
                     continue
 
                 number = row[cited_col]
 
                 totals[number] += 1
 
-                if category_col is not None and len(row) > category_col:
+                if category_col is not None:
                     by_category[number][row[category_col]] += 1
 
-    return totals, by_category, [path.name for path in files]
+                if citing_col is not None:
+                    citing = row[citing_col]
+                    if citing not in citing_seen:
+                        citing_seen.add(citing)
+                        citing_types[
+                            (row[citing_type_col] if citing_type_col is not None else "")
+                            or classify_patent_type(citing)
+                        ] += 1
+
+                if citing_date_col is not None:
+                    year = _year(row[citing_date_col])
+                    if year and (coverage_year is None or year > coverage_year):
+                        coverage_year = year
+
+    return {
+        "totals": totals,
+        "by_category": by_category,
+        "citing_types": citing_types,
+        "coverage_year": coverage_year or datetime.now().year,
+        "files": [path.name for path in files],
+    }
 
 
-def build_patents_sheet(workbook, notes):
+def _patent_table(sheet, row, title, ranked, cites, extra_header=None):
 
-    print("\nPATENTS")
+    """Top-N patent table. `ranked` is a list of
+    (patent_number, extra_value_or_None). Returns the next free
+    row."""
 
-    patents, file_counts, duplicates, classified = load_filtered_patents()
+    patents, totals, by_category = cites["patents"], cites["totals"], cites["by_category"]
+
+    _write_title(sheet, row, title)
+
+    header = [
+        "Rank", "Patent", "Title", "Assignee", "Year", "Patent type",
+        "Claim category", "Times cited", "Cited by applicant",
+        "Cited by examiner", "Cited by other / unknown",
+    ]
+    if extra_header:
+        header.append(extra_header)
+
+    rows = []
+
+    for rank, (number, extra) in enumerate(ranked, start=1):
+
+        patent = patents.get(number, {})
+        split = by_category.get(number, Counter())
+        count = totals.get(number, 0)
+
+        values = [
+            rank, number, patent.get("title", ""), patent.get("assignee", ""),
+            patent.get("year"), patent.get("patent_type", ""),
+            patent.get("claim_category", ""), count,
+            split.get("applicant", 0), split.get("examiner", 0),
+            count - split.get("applicant", 0) - split.get("examiner", 0),
+        ]
+        if extra_header:
+            values.append(extra)
+
+        rows.append(values)
+
+    if not rows:
+        sheet.cell(row=row + 1, column=1, value="No forward-citation pairs found -- run the forward-citations --export first.")
+        return row + 3
+
+    bottom = _write_table(sheet, row + 1, 1, header, rows)
+
+    for r in range(row + 2, bottom + 1):
+        sheet.cell(row=r, column=5).number_format = "0"
+        sheet.cell(row=r, column=3).alignment = Alignment(wrap_text=True, vertical="top")
+        if extra_header:
+            sheet.cell(row=r, column=len(header)).number_format = "0.00"
+
+    return bottom + 2
+
+
+def build_patents_sheet(workbook, notes, data, cites):
+
+    patents, file_counts, duplicates, classified = data
 
     sheet = workbook.create_sheet("Patents")
 
@@ -481,46 +754,83 @@ def build_patents_sheet(workbook, notes):
 
     # --- 4. top 10 by forward citations -------------------------
 
-    print("\nFORWARD CITATIONS")
+    row = _patent_table(
+        sheet, row, f"Top {TOP_N_PATENTS} patents by forward citations",
+        [(number, None) for number, _ in cites["totals"].most_common(TOP_N_PATENTS)],
+        cites,
+    )
 
-    totals, by_category, pair_files = load_forward_citation_counts()
+    # --- 5. patents per year: grants vs applications ------------
 
-    _write_title(sheet, row, f"Top {TOP_N_PATENTS} patents by forward citations")
+    year_counts = defaultdict(Counter)
 
-    header = [
-        "Rank", "Patent", "Title", "Assignee", "Year", "Patent type",
-        "Claim category", "Times cited", "Cited by applicant",
-        "Cited by examiner", "Cited by other / unknown",
-    ]
+    for patent in patents.values():
+        if patent["year"] is not None:
+            year_counts[patent["year"]]["Applications" if patent["is_application"] else "Grants"] += 1
 
-    top_rows = []
+    _write_title(sheet, row, "Patents per year (grants vs applications)")
 
-    for rank, (number, count) in enumerate(totals.most_common(TOP_N_PATENTS), start=1):
+    table_top = row + 1
+    years = range(min(year_counts), max(year_counts) + 1) if year_counts else []
+    table_bottom = _write_table(
+        sheet, table_top, 1, ["Year", "Grants", "Applications"],
+        [[str(year), year_counts[year]["Grants"], year_counts[year]["Applications"]] for year in years],
+    )
 
-        patent = patents.get(number, {})
-        split = by_category.get(number, Counter())
+    if year_counts:
+        chart = LineChart()
+        chart.title = "Patents per year"
+        chart.width, chart.height = 26, 11
+        chart.y_axis.title = "Documents"
+        chart.x_axis.title = "Year (grant date; publication date for applications)"
+        chart.add_data(Reference(sheet, min_col=2, max_col=3, min_row=table_top, max_row=table_bottom), titles_from_data=True)
+        chart.set_categories(Reference(sheet, min_col=1, min_row=table_top + 1, max_row=table_bottom))
+        chart.x_axis.delete = False
+        chart.y_axis.delete = False
+        chart.y_axis.scaling.min = 0
+        chart.x_axis.tickLblSkip = 5
+        sheet.add_chart(chart, f"E{table_top}")
 
-        top_rows.append([
-            rank,
-            number,
-            patent.get("title", ""),
-            patent.get("assignee", ""),
-            patent.get("year"),
-            patent.get("patent_type", ""),
-            patent.get("claim_category", ""),
-            count,
-            split.get("applicant", 0),
-            split.get("examiner", 0),
-            count - split.get("applicant", 0) - split.get("examiner", 0),
-        ])
+    row = max(table_bottom, table_top + 24) + 2
 
-    if top_rows:
-        table_bottom = _write_table(sheet, row + 1, 1, header, top_rows)
-        for r in range(row + 2, table_bottom + 1):
-            sheet.cell(row=r, column=5).number_format = "0"
-            sheet.cell(row=r, column=3).alignment = Alignment(wrap_text=True, vertical="top")
-    else:
-        sheet.cell(row=row + 1, column=1, value="No forward-citation pairs found -- run the forward-citations --export first.")
+    # --- 6. top CPC subclasses ----------------------------------
+
+    subclass_counts = Counter()
+    subclass_cites = Counter()
+
+    for number, patent in patents.items():
+        for subclass in patent["subclasses"]:
+            subclass_counts[subclass] += 1
+            subclass_cites[subclass] += cites["totals"].get(number, 0)
+
+    _write_title(sheet, row, f"Top {TOP_N_CPC} CPC subclasses")
+
+    table_top = row + 1
+    top_subclasses = subclass_counts.most_common(TOP_N_CPC)
+    table_bottom = _write_table(
+        sheet, table_top, 1,
+        ["Subclass", "Patents", "Share of corpus", "Forward citations", "Title"],
+        [
+            [
+                subclass, count,
+                round(count / len(patents), 4) if patents else 0,
+                subclass_cites[subclass],
+                CPC_SUBCLASS_TITLES.get(subclass, ""),
+            ]
+            for subclass, count in top_subclasses
+        ],
+    )
+
+    for r in range(table_top + 1, table_bottom + 1):
+        sheet.cell(row=r, column=3).number_format = "0.0%"
+
+    if top_subclasses:
+        _bar_chart(
+            sheet, f"Top {TOP_N_CPC} CPC subclasses", table_top, 1, table_bottom, 1,
+            anchor=f"G{table_top}", y_title="Patents", horizontal=True, width=20, height=11,
+        )
+
+    row = max(table_bottom, table_top + 22) + 2
 
     _set_widths(sheet, {
         "A": 30, "B": 18, "C": 48, "D": 30, "E": 14, "F": 20,
@@ -544,8 +854,166 @@ def build_patents_sheet(workbook, notes):
             "Claim category is missing from the filter results -- run "
             "uspto_patent_pipeline_v15.py --classify, then re-run this report."
         ])
-    notes.append(["Forward citations counted from", ", ".join(pair_files) or "(none found)"])
+    notes.append([
+        "CPC subclasses: a patent counts once in each subclass it carries "
+        "(IPC used for records with no CPC); shares add to more than 100%."
+    ])
+    notes.append([])
+
+
+def build_citations_sheet(workbook, notes, data, cites):
+
+    patents = data[0]
+    totals = cites["totals"]
+    coverage_year = cites["coverage_year"]
+
+    sheet = workbook.create_sheet("Citations")
+
+    _write_title(sheet, 1, "Forward citations to the filtered patents", TITLE_FONT)
+
+    sheet.cell(
+        row=2, column=1,
+        value=(
+            f"{sum(totals.values()):,} citations to {len(totals):,} of "
+            f"{len(patents):,} filtered patents; citing patents through {coverage_year}"
+        ),
+    )
+
+    # --- 1. distribution ----------------------------------------
+
+    bucket_counts = Counter()
+
+    for number in patents:
+        count = totals.get(number, 0)
+        for label, low, high in CITATION_BUCKETS:
+            if count >= low and (high is None or count <= high):
+                bucket_counts[label] += 1
+                break
+
+    row = 4
+    _write_title(sheet, row, "How often filtered patents are cited")
+
+    table_top = row + 1
+    table_bottom = _write_table(
+        sheet, table_top, 1, ["Times cited", "Patents", "Share"],
+        [
+            [label, bucket_counts[label], round(bucket_counts[label] / len(patents), 4) if patents else 0]
+            for label, _, _ in CITATION_BUCKETS
+        ],
+    )
+
+    for r in range(table_top + 1, table_bottom + 1):
+        sheet.cell(row=r, column=3).number_format = "0.0%"
+
+    _bar_chart(
+        sheet, "Filtered patents by times cited", table_top, 1, table_bottom, 1,
+        anchor=f"E{table_top}", x_title="Times cited", y_title="Patents", width=20, height=10,
+    )
+
+    row = max(table_bottom, table_top + 20) + 2
+
+    # --- 2. top 10 by citations per year ------------------------
+
+    rates = []
+
+    for number, count in totals.items():
+        patent = patents.get(number)
+        if not patent or patent["year"] is None or count < CITATION_RATE_MIN_CITES:
+            continue
+        years = max(CITATION_RATE_MIN_YEARS, coverage_year - patent["year"])
+        rates.append((count / years, number))
+
+    rates.sort(reverse=True)
+
+    row = _patent_table(
+        sheet, row,
+        f"Top {TOP_N_PATENTS} patents by citations per year "
+        f"(at least {CITATION_RATE_MIN_CITES} citations)",
+        [(number, round(rate, 2)) for rate, number in rates[:TOP_N_PATENTS]],
+        cites, extra_header="Citations per year",
+    )
+
+    # --- 3. average citations by claim category -----------------
+
+    category_patents = Counter()
+    category_cites = Counter()
+    category_cited = Counter()
+
+    for number, patent in patents.items():
+        category = patent["claim_category"]
+        count = totals.get(number, 0)
+        category_patents[category] += 1
+        category_cites[category] += count
+        if count:
+            category_cited[category] += 1
+
+    categories = [c for c in CLAIM_CATEGORY_ORDER if category_patents.get(c)]
+    categories += sorted(c for c in category_patents if c not in categories)
+
+    _write_title(sheet, row, "Average forward citations by claim category")
+
+    table_top = row + 1
+    table_bottom = _write_table(
+        sheet, table_top, 1,
+        ["Claim category", "Average citations per patent", "Patents", "Cited at least once", "Total citations"],
+        [
+            [
+                c,
+                round(category_cites[c] / category_patents[c], 2),
+                category_patents[c], category_cited[c], category_cites[c],
+            ]
+            for c in categories
+        ],
+    )
+
+    for r in range(table_top + 1, table_bottom + 1):
+        sheet.cell(row=r, column=2).number_format = "0.00"
+
+    _bar_chart(
+        sheet, "Average forward citations per patent, by claim category",
+        table_top, 1, table_bottom, 1,
+        anchor=f"G{table_top}", y_title="Citations per patent", width=22, height=10,
+    )
+
+    row = max(table_bottom, table_top + 20) + 2
+
+    # --- 4. who cites them --------------------------------------
+
+    _write_title(sheet, row, "Documents citing the filtered patents, by type")
+
+    citing = cites["citing_types"]
+    total_citing = sum(citing.values())
+
+    table_top = row + 1
+    table_bottom = _write_table(
+        sheet, table_top, 1, ["Citing document type", "Citing documents", "Share"],
+        [
+            [label, count, round(count / total_citing, 4) if total_citing else 0]
+            for label, count in citing.most_common()
+        ],
+    )
+
+    for r in range(table_top + 1, table_bottom + 1):
+        sheet.cell(row=r, column=3).number_format = "0.0%"
+
+    _set_widths(sheet, {
+        "A": 34, "B": 18, "C": 48, "D": 30, "E": 14, "F": 20,
+        "G": 20, "H": 14, "I": 14, "J": 14, "K": 14, "L": 14,
+    })
+
+    notes.append(["CITATIONS"])
+    notes.append(["Forward citations counted from", ", ".join(cites["files"]) or "(none found)"])
     notes.append(["Filtered patents cited at least once", len(totals)])
+    notes.append([
+        "Citations per year = times cited / years from grant to "
+        f"{coverage_year} (the latest citing-patent year), at least "
+        f"{CITATION_RATE_MIN_YEARS:g} year; patents with fewer than "
+        f"{CITATION_RATE_MIN_CITES} citations are left out of that table."
+    ])
+    notes.append([
+        "Citing documents are counted once each, however many filtered "
+        "patents they cite."
+    ])
     notes.append([])
 
 
@@ -595,7 +1063,7 @@ def build_crawl_sheets(workbook, notes):
     if not TDS_MANIFEST.exists():
         sheet = workbook.create_sheet("Crawl")
         sheet.cell(row=1, column=1, value=f"{TDS_MANIFEST} not found -- run tds_crawler_v1.py --export first.")
-        return
+        return {}
 
     with open(TDS_MANIFEST, "r", newline="", encoding="utf-8-sig") as handle:
         documents = list(csv.DictReader(handle))
@@ -785,7 +1253,79 @@ def build_crawl_sheets(workbook, notes):
         language_counts.most_common(),
     )
 
-    _set_widths(sheet, {"A": 44, "B": 14, "C": 4})
+    # --- material category x document type ----------------------
+
+    type_order = [label for label, _ in type_counts.most_common()]
+    matrix = defaultdict(Counter)
+
+    for d in kept:
+        doc_type = (d.get("doc_type_from_text") or "").strip()
+        matrix[(d.get("category_folder") or "Unassigned").replace("_", " ")][
+            DOC_TYPE_LABEL.get(doc_type.lower(), doc_type or "Unknown")
+        ] += 1
+
+    _write_title(sheet, row, "Documents by material category and type (kept documents)")
+
+    matrix_rows = [
+        [category] + [matrix[category].get(t, 0) for t in type_order] + [sum(matrix[category].values())]
+        for category in sorted(matrix)
+    ]
+    matrix_rows.append(
+        ["Total"] + [type_counts[t] for t in type_order] + [len(kept)]
+    )
+
+    bottom = _write_table(sheet, row + 1, 1, ["Material category"] + type_order + ["Total"], matrix_rows)
+
+    for c in range(1, len(type_order) + 3):
+        sheet.cell(row=bottom, column=c).font = Font(bold=True)
+
+    row = bottom + 3
+
+    # --- vendors with no kept documents --------------------------
+
+    def no_document_reason(r):
+        name, status, crawled, seen, link_count, downloaded = r[0], r[2], r[3], r[4], r[5], r[6]
+        page_states = pages.get(name, Counter())
+        if status == "skip":
+            return "Skipped: status=skip in vendor_seeds.csv"
+        if seen == 0:
+            return "Not crawled yet: no pages fetched"
+        if crawled == 0:
+            return (
+                f"Site blocked or erroring: {page_states.get('blocked', 0)} blocked, "
+                f"{page_states.get('error', 0)} errors, {page_states.get('queued', 0)} still queued"
+            )
+        if link_count == 0:
+            return f"No PDF links found on {crawled:,} pages crawled"
+        if downloaded == 0:
+            outcomes = ", ".join(
+                f"{state or 'blank'} {count}" for state, count in links.get(name, Counter()).most_common(3)
+            )
+            return f"PDF links found but none downloaded ({outcomes})"
+        if r[12] and not r[13]:
+            return f"Only foreign-language copies ({r[12]}), no English version kept"
+        if r[13]:
+            return f"All downloaded files rejected ({r[13]})"
+        return "Downloads not kept (off-topic files are deleted -- see logs\\deleted_off_topic_*.csv)"
+
+    empty = [r for r in vendor_rows if not r[8]]
+
+    _write_title(sheet, row, f"Vendors with no kept documents ({len(empty)})")
+
+    bottom = _write_table(
+        sheet, row + 1, 1,
+        ["Vendor", "Material category", "Seed status", "Pages crawled",
+         "PDF links found", "PDF links downloaded", "Translations", "Rejected", "Reason"],
+        [
+            [r[0], r[1], r[2], r[3], r[5], r[6], r[12], r[13], no_document_reason(r)]
+            for r in sorted(empty, key=lambda r: r[0].lower())
+        ],
+    )
+
+    if not empty:
+        sheet.cell(row=row + 2, column=1, value="Every vendor has at least one kept document.")
+
+    _set_widths(sheet, {"A": 44, "B": 22, "C": 16, "D": 14, "E": 14, "F": 14, "G": 14, "H": 14, "I": 60})
 
     # --- Vendors sheet ------------------------------------------
 
@@ -821,6 +1361,175 @@ def build_crawl_sheets(workbook, notes):
     notes.append([
         "'PDF links downloaded' includes links whose file was a duplicate of "
         "one already saved or unchanged since the last run."
+    ])
+    notes.append([])
+
+    return {
+        r[0]: {"category": r[1], "kept": r[8], "tds": r[9], "sds": r[10]}
+        for r in vendor_rows
+    }
+
+
+# ============================================================
+# VENDORS & PATENTS
+# ============================================================
+
+# Words that don't identify a company. Stripped from both vendor
+# names and assignee names before matching, so "3M Company" and
+# "3M Innovative Properties Company" both reduce to start "3m".
+_CORPORATE_WORDS = {
+    "inc", "incorporated", "corp", "corporation", "company", "co",
+    "ltd", "limited", "llc", "lp", "llp", "plc", "gmbh", "mbh", "ag",
+    "kg", "kgaa", "se", "sa", "sas", "spa", "srl", "bv", "nv", "oy",
+    "oyj", "ab", "as", "asa", "aps", "kk", "the", "and", "of",
+    "holding", "holdings", "group", "international", "intl",
+}
+
+# A one-word vendor name this short or generic would match too
+# many unrelated assignees; such names need a second word.
+_MIN_SINGLE_WORD_LENGTH = 3
+
+
+def _company_words(name):
+
+    text = (name or "").lower().replace("&", " ")
+    text = re.sub(r"[^\w\s]", " ", text)
+
+    return [w for w in text.split() if w and w not in _CORPORATE_WORDS]
+
+
+def build_vendor_patent_sheet(workbook, notes, data, cites, vendor_summary):
+
+    print("\nVENDORS & PATENTS")
+
+    patents = data[0]
+    totals = cites["totals"]
+
+    sheet = workbook.create_sheet("Vendors & Patents")
+
+    _write_title(sheet, 1, "Data-sheet vendors that also hold filtered patents", TITLE_FONT)
+
+    if not vendor_summary:
+        sheet.cell(row=3, column=1, value="No crawl manifest found.")
+        return
+
+    # Index vendors by their first identifying word.
+    by_first_word = defaultdict(list)
+
+    for vendor in vendor_summary:
+        words = _company_words(vendor)
+        if not words:
+            continue
+        if len(words) == 1 and len(words[0]) < _MIN_SINGLE_WORD_LENGTH and not words[0][0].isdigit():
+            continue
+        by_first_word[words[0]].append((vendor, words))
+
+    matched = defaultdict(list)          # vendor -> [patent numbers]
+    assignee_names = defaultdict(Counter)
+
+    for number, patent in patents.items():
+
+        hit_vendors = set()
+
+        for assignee in re.split(r";", patent["assignee"]):
+
+            words = _company_words(assignee)
+
+            if not words:
+                continue
+
+            for vendor, vendor_words in by_first_word.get(words[0], []):
+                if words[:len(vendor_words)] == vendor_words:
+                    hit_vendors.add(vendor)
+                    assignee_names[vendor][assignee.strip()] += 1
+
+        for vendor in hit_vendors:
+            matched[vendor].append(number)
+
+    rows = []
+
+    for vendor, numbers in matched.items():
+
+        info = vendor_summary[vendor]
+        cited = [n for n in numbers if totals.get(n)]
+        top = max(numbers, key=lambda n: totals.get(n, 0))
+
+        rows.append([
+            vendor,
+            info["category"],
+            info["kept"],
+            info["tds"],
+            len(numbers),
+            sum(1 for n in numbers if not patents[n]["is_application"]),
+            sum(1 for n in numbers if patents[n]["is_application"]),
+            len(cited),
+            sum(totals.get(n, 0) for n in numbers),
+            top if totals.get(top) else "",
+            patents[top]["title"] if totals.get(top) else "",
+            "; ".join(name for name, _ in assignee_names[vendor].most_common(3)),
+        ])
+
+    rows.sort(key=lambda r: (-r[4], r[0].lower()))
+
+    sheet.cell(
+        row=2, column=1,
+        value=(
+            f"{len(rows)} of {len(vendor_summary)} crawled vendors matched to "
+            f"patent assignees by name"
+        ),
+    )
+
+    _write_title(sheet, 4, f"Top {TOP_N_VENDORS} vendors by filtered patents")
+
+    chart_top = 5
+    chart_bottom = _write_table(
+        sheet, chart_top, 1, ["Vendor", "Filtered patents"],
+        [[r[0], r[4]] for r in rows[:TOP_N_VENDORS]],
+    )
+
+    if rows:
+        _bar_chart(
+            sheet, f"Top {TOP_N_VENDORS} vendors by filtered patents",
+            chart_top, 1, chart_bottom, 1, anchor=f"D{chart_top}",
+            y_title="Patents", horizontal=True, width=22, height=12,
+        )
+
+    row = max(chart_bottom, chart_top + 24) + 2
+
+    _write_title(sheet, row, "All matched vendors")
+
+    header = [
+        "Vendor", "Material category", "Documents kept", "Technical data sheets",
+        "Filtered patents", "Grants", "Applications", "Patents cited at least once",
+        "Total forward citations", "Most-cited patent", "Most-cited patent title",
+        "Assignee names matched (top 3)",
+    ]
+
+    bottom = _write_table(sheet, row + 1, 1, header, rows)
+
+    if rows:
+        sheet.auto_filter.ref = f"A{row + 1}:{get_column_letter(len(header))}{bottom}"
+
+    sheet.row_dimensions[row + 1].height = 32
+
+    _set_widths(sheet, {
+        "A": 34, "B": 24, "C": 12, "D": 12, "E": 12, "F": 12, "G": 12,
+        "H": 12, "I": 12, "J": 16, "K": 48, "L": 60,
+    })
+
+    print(f"  {len(rows)} vendors matched to assignees")
+
+    notes.append(["VENDORS & PATENTS"])
+    notes.append([
+        "Vendors are matched to patent assignees by name: corporate words "
+        "(Inc, Corp, GmbH, Company ...) are dropped and the assignee must "
+        "begin with the vendor's remaining words, so '3M Company' matches "
+        "'3M Innovative Properties Company'."
+    ])
+    notes.append([
+        "It's approximate: a subsidiary under a different name is missed, "
+        "and a shared first name (e.g. 'Dow' / 'Dow Corning') can match. "
+        "Check the 'Assignee names matched' column."
     ])
     notes.append([])
 
@@ -931,8 +1640,19 @@ def main():
         workbook = openpyxl.Workbook()
         workbook.remove(workbook.active)
 
-        build_patents_sheet(workbook, notes)
-        build_crawl_sheets(workbook, notes)
+        print("\nPATENTS")
+        data = load_filtered_patents()
+
+        print("\nFORWARD CITATIONS")
+        cites = load_forward_citation_counts()
+        cites["patents"] = data[0]
+
+        build_patents_sheet(workbook, notes, data, cites)
+        build_citations_sheet(workbook, notes, data, cites)
+
+        vendor_summary = build_crawl_sheets(workbook, notes)
+
+        build_vendor_patent_sheet(workbook, notes, data, cites, vendor_summary)
 
     if not args.no_copy:
         copy_files(notes)
