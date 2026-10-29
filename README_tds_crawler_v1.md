@@ -66,7 +66,7 @@ python -m pip install playwright        # optional: only for --js
 
 ### Which version ran?
 
-The first log line of every run shows the build, the rules version and the path of the script, e.g. `tds_crawler_v1 build 2026-10-25 r22 (rules v12) - C:\...\tds_crawler_v1.py`. Browsers often save a re-downloaded file as `tds_crawler_v1 (1).py`, so check that line after replacing the script. When the sorting rules change (the rules version goes up), `--classify` re-checks every file automatically; a run without `--classify` warns that files were sorted by older rules.
+The first log line of every run shows the build, the rules version and the path of the script, e.g. `tds_crawler_v1 build 2026-10-26 r25 (rules v12) - C:\...\tds_crawler_v1.py`. Browsers often save a re-downloaded file as `tds_crawler_v1 (1).py`, so check that line after replacing the script. When the sorting rules change (the rules version goes up), `--classify` re-checks every file automatically; a run without `--classify` warns that files were sorted by older rules.
 
 ---
 
@@ -74,7 +74,7 @@ The first log line of every run shows the build, the rules version and the path 
 
 | Stage | Command | What happens |
 |---|---|---|
-| Discover | `--discover` | Reads each supplier's robots.txt and sitemaps, reads document APIs where available, then follows links from the start pages (most promising first) and records every PDF link with a type guessed from its address and link text. |
+| Discover | `--discover` | Reads each supplier's robots.txt and sitemaps, reads document APIs where available, then follows links from the start pages (most promising first) and records every PDF link with a type guessed from its address and link text. Skips off-topic site sections (`scope_exclude`) and contact, registration, login and search-form pages. |
 | Download | `--download` | Downloads the PDF links of the wanted types (by default everything except corporate documents). Keeps only real PDFs, skips files over 50 MB, and stores identical files once (SHA-256). |
 | Classify | `--classify` | Reads the first pages of each new file: document type, title, page count, language, test methods cited. Deletes off-topic files (logged), moves foreign copies to `_translations` and unreadable files to `_rejected`. |
 | Export | `--export` | Writes `tds_manifest.csv` and `tds_catalog.xlsx`. |
@@ -135,7 +135,7 @@ Keep the catalog in `D:\tds_corpus` so the links work. If it's open in Excel dur
 | `logs\tds_crawler_YYYYMMDD.log` | The first line (version). `WARNING`/`ERROR` lines. "Still working" blocks every 5 minutes on long runs. |
 | `logs\deleted_off_topic_YYYYMMDD.csv` | Every deleted file (`deleted_at`, `vendor`, `reason`, `path`, `source_url`, `sha256`). Skim it after a classify run to be sure nothing useful was removed. |
 | `tds_catalog.xlsx` → Rejected / Translations | Files set aside and why; translations with no English version. |
-| `tds_crawler.db` | Full state. Table `pdf_links` has every link and its outcome (below). |
+| `tds_crawler.db` | Full state. Table `pages` has every page and its state (`done`, `queued`, `error`, `blocked`, or `skipped` = out of scope or a form page); table `pdf_links` has every link and its outcome (below). |
 
 **What happens to PDF links** (the `state` column of `pdf_links`):
 
@@ -167,6 +167,7 @@ Ctrl-C works at once: the first press finishes the current requests and saves st
 - **Document type and language are read from the PDF text.** Scanned (image-only) PDFs can't be read and are labelled `unreadable`; encrypted PDFs need `cryptography`.
 - **The first 2 pages decide the document type; the first 6 decide the topic.** A data sheet with a long cover section may be typed as a general technical document.
 - **Websites change.** Re-running finds new documents; `--download --refresh` re-checks existing ones (a changed sheet is saved as a new file and the old one kept).
+- **One bad page doesn't stop a supplier.** A page that fails in an unexpected way (for example a malformed redirect, as some dow.com pages send) is logged as an error and the crawl moves on.
 - **Your manual changes are respected.** Move a PDF yourself and the crawler finds its new location; delete one and it isn't downloaded again. If a large share of files seem missing (e.g. the drive isn't connected), nothing is changed.
 
 ---
@@ -237,6 +238,7 @@ Every downloaded file is read (first 6 pages). **Anything that relates to these 
   - **International Paper:** third-party industry reports (glass / steel / aluminium recycling, food surveys, legislation) off-topic.
   - **Kruger:** newsletters, energy and corporate reports off-topic.
   - KraussMaffei, Akzo Nobel and Schlenk are kept whole (injection molding, aerospace coatings and pigments included).
+  `scope_exclude` also steers the crawl (r23): pages whose address matches it (and not `scope_keep`) aren't visited at all, e.g. DuPont's `/water/` section, 3M abrasives and PPE, Dow building & construction. Pages already queued from an earlier run are marked `skipped`. Contact-us, sample-request, registration, login, distributor-finder and site-search pages are skipped for every vendor.
   Add the same columns to any other broad vendor; the next `--classify` applies them to new files (run `--reclassify` to re-check existing ones).
 - **Avery Dennison medical:** sprays, creams, swabs and lotions (not webs). Dressings, tapes, films and labels stay.
 - **ExxonMobil:** every product document counts as on-topic (`TOPIC_KEEP_ALL_VENDORS` near the top of the script).
@@ -308,3 +310,12 @@ When a vendor appears in the workbook but has no seed row, the script adds one a
 ## Politeness defaults
 
 The crawler waits 2 s between requests to each vendor, or longer if robots.txt sets a Crawl-delay. It processes 4 vendors in parallel, backs off on 429 and 503 responses, follows robots.txt rules, and sends an identifying User-Agent; add your contact with `--contact`. Site terms vary, and some vendors (UL Prospector-style portals, 3M) forbid automated download, so check before running high volumes.
+
+## Recent changes
+
+| Build | Change |
+|---|---|
+| r25 (2026-10-26) | A page that fails unexpectedly no longer ends a supplier's crawl; malformed redirects (dow.com) are treated as a failed request; the log lists suppliers with their own page limits |
+| r23–r24 | `scope_exclude` keeps off-topic site sections from being crawled at all; contact, registration, login, sample-request, distributor-finder and site-search pages skipped for every supplier |
+| r22 (2026-10-25) | Document APIs (Qnity, WordPress media library, Dow viewer links), per-vendor page caps, no-stall long runs |
+| r13–r21 | Vendor scopes, company-paperwork rules in the main European languages, more languages detected |
