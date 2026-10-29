@@ -1,188 +1,172 @@
-# USPTO Forward-Citation Cross-Reference (`uspto_forward_citations_v1.py`)
+# USPTO Forward Citations (`uspto_forward_citations_v5.py`, v5.1)
 
-Takes the patent IDs in `filtered_patents.csv` (produced by the main
-pipeline's `--filter` stage) and finds every OTHER patent in the local
-corpus that **cites** each one — the reverse of what's in the raw data,
-since each patent record only lists what *it* cites, never who cites it.
+For every patent selected by the [patent pipeline](README_pipeline_v15.md), finds the **later** patents that cite it, so you can see which patents the field actually built on.
 
-## Relationship to `uspto_patent_pipeline_v12.py`
-
-This is a separate, standalone script — **run the main pipeline first**,
-through at least `--filter` (`--pdf` is NOT required — this script never
-reads PDFs at all, it only reads the raw extracted XML/SGML/APS files and
-`filtered_patents.csv`). It never touches the main pipeline's SQLite
-database, so there's nothing to reconcile between the two and nothing you
-can break in one by running the other.
-
-```
-python uspto_patent_pipeline_v12.py --filter        # produces filtered_patents.csv (--pdf optional, not needed here)
-python uspto_forward_citations_v1.py --all           # then this
-```
-
-## Before running
-
-Only one setting needs to match the main pipeline:
-
-```python
-BULK_DATA_ROOT_DIR = Path(r"D:\uspto_corpus")   # same value as in v12
-```
-
-Everything else (`EXTRACTED_DIR`, `RESULTS_DIR`, etc.) is derived from it
-the same way the main pipeline derives its own paths.
-
-## Running it
-
-```
-python uspto_forward_citations_v1.py --sample 25 --all   # start here — scan+export on a small slice
-python uspto_forward_citations_v1.py --all                 # full corpus scan + export
-python uspto_forward_citations_v1.py --verify                # coverage stats + match-quality report
-python uspto_forward_citations_v1.py --reset                 # delete the citation index and start over
-```
-
-Unlike the main pipeline, `--sample` and `--all` **do** combine correctly
-here — `python uspto_forward_citations_v1.py --sample 25 --all` really
-does limit the scan to ~25 files.
-
-`--scan` builds a restartable SQLite index of citation hits; `--export`
-writes the Excel/CSV output from whatever's in that index; `--all` runs
-both. Scanning is safe to interrupt and restart — already-scanned files
-(matched by size) are skipped, and files that errored are automatically
-retried on the next run rather than silently marked done.
-
-**One thing `--reset` and restartability don't cover automatically:** the
-index tracks "already scanned" per *file*, not per *target set*. If you
-rerun `--filter` in the main pipeline with a different CPC/keyword matrix,
-producing a different `filtered_patents.csv`, files already scanned under
-the old target set will be skipped — even if they'd contain a real hit
-against your new filtered patents. Run `--reset` before `--scan` whenever
-`filtered_patents.csv`'s *content* has changed, not just when re-running
-against the same one.
-
-## What it reads and how it matches
-
-Scans every file under `EXTRACTED_DIR`, auto-detecting format (APS/SGML/XML
-— same three eras the main pipeline handles), and reads each record's
-**cited-reference list**:
-
-| Format | Where citations live | Category available? |
-|---|---|---|
-| XML (grants, ~2001–present) | `<us-references-cited>` / `<references-cited>`, one `<patcit>` per `<us-citation>` | Yes — `<category>`: examiner / applicant / third-party |
-| SGML (~1996–2001) | `B560` → `B561` blocks (patent cites); `B562` (non-patent lit) is skipped | Partial — `CITED-BY-EXAMINER` / `CITED-BY-OTHER` only (this era predates the three-way split; `OTHER` is **not** assumed to mean "applicant") |
-| APS/Green Book (~1976–1996) | `UREF` sections, `PNO` field; `FREF` (foreign) and `OREF` (non-patent) skipped; `REIS` section's own `PNO` (the original patent being reissued) is correctly excluded | No — this era carries no per-reference provenance marker at all; always reports `unknown` |
-
-Only US patent-document citations count — foreign families and non-patent
-literature are excluded, since they can't match a US patent ID anyway.
-
-**Patent-number normalization** handles every format the main pipeline
-produces (`US10123456B2`, `US06167569A`, `USD0435713S`, `D. 254336`,
-`2790186`, `USPP011728P`, ...) plus the APS-era **check-digit ambiguity**:
-APS numbers carry a trailing check digit the main pipeline stores raw, so
-`US39302711` is really patent 3,930,271. Both interpretations are tried,
-and `--verify` reports which one actually matched real citations.
-
-## Output
-
-| File | Contents |
+| | |
 |---|---|
-| `RESULTS/FORWARD CITATIONS/forward_citations.xlsx` | One row per filtered patent — see columns below |
-| `RESULTS/FORWARD CITATIONS/forward_citation_pairs.csv` | **Authoritative, unlimited** long-format version: one row per citing/cited pair, with the citing patent's own date and that specific citation's category. Also carries the filtered patent's type and claim category and the citing patent's type (v5.1). Excel has hard row/cell limits a large corpus can exceed; this CSV never truncates. |
-| `RESULTS/FORWARD CITATIONS/forward_citation_match_report.csv` | Per-patent detail on how number matching resolved (from `--verify`) |
-| `DATABASE/FORWARD_CITATIONS.sqlite` | The restartable citation index itself |
+| **Input** | `D:\uspto_corpus\RESULTS\FILTERED\filtered_patents.csv` (from the pipeline's `--filter`) + the weekly archives in `D:\uspto_corpus\RAW\` |
+| **Main output** | `D:\uspto_corpus\RESULTS\FORWARD CITATIONS\forward_citations.xlsx` |
+| **Run time** | Hours for the full corpus (scan); a few minutes to re-export |
+| **Needs** | The pipeline run through `--filter` (and ideally `--classify`). PDFs are not needed. |
+| **Next step** | The [overview report](README_overview_report_v1.md) |
 
-### `forward_citations.xlsx` columns
+*(This README keeps its original file name so existing links still work; it documents script v5.1.)*
 
-| Column | Meaning |
-|---|---|
-| Patent Type | USPTO document type from the number/kind code — Utility, Design, Plant, Reissue, SIR, Defensive Publication, Application (utility/plant) |
-| Claim Category | What claim 1 claims — Process / Method, Apparatus / System, Product / Article, Composition, Product-by-process, Design, Plant (from pipeline v15.10's `--filter` or `--classify`; blank if `filtered_patents.csv` is older) |
-| Independent Claim Categories | Every category across the patent's independent claims, e.g. `Process / Method; Apparatus / System` |
-| Times Cited | Raw forward-citation count |
-| Citations Per Year | Times Cited ÷ years the patent has sat inside the corpus's *observable* window — see "Rate normalization" below |
-| Cohort Percentile | Times Cited ranked against other **filtered** patents granted in the same multi-year window — blank if the patent's date didn't parse or its cohort has too few members |
-| Cited by Applicant | Citations where the citing document explicitly pointed to this prior art — the stronger influence signal |
-| Cited by Examiner | Citations that mostly reflect the examiner's own search overlap, not necessarily the field's use of the invention |
-| Cited by Other/Unknown | SGML's non-examiner "other" (may or may not be applicant-sourced) plus all APS-era citations, which carry no provenance marker |
-| Citing Patent IDs | Split across multiple columns if the list would exceed Excel's ~32,767-character cell limit |
+---
 
-Rows are sorted most-cited first.
+## Why it exists
 
-**Patent type / claim category (v5.1).** The type and claim-category columns
-come straight from `filtered_patents.csv`. If that file was filtered before
-pipeline v15.10, run `uspto_patent_pipeline_v15.py --classify` once, then
-`--export` here again — no re-scan needed (Patent Type is filled from the
-number either way). The pairs sheets add Filtered Patent Type, Filtered
-Claim Category and Citing Patent Type, and Run Notes lists how many filtered
-patents fall in each claim category and how often each group was cited. A "Run Notes" sheet records exactly what
-the run covered, what coverage year was used, and all the caveats below.
+Every patent lists the earlier patents it cites ("references cited"). A **forward citation** is the reverse: a later patent listing *this* one. Forward citations are the standard measure of a patent's influence, but nothing in USPTO's data says "who cites me". The script works it out by reading the reference list of every patent in the corpus and keeping the ones that point at a selected patent.
 
-## Rate normalization — what it means and what it doesn't
+It runs entirely offline. It replaced the PatentsView API, which shut down in March 2026.
 
-A raw citation count is a weak value signal on its own: it's dominated by
-how *old* a patent is (more years to accumulate citations) and by how
-citation *practice* has drifted across a 1976–present corpus.
+## Quick start
 
-**Citations Per Year.** The denominator is capped at the corpus's own
-forward edge, not "years since grant to today" — a patent shouldn't get
-credit for years the corpus can't actually show citations for. By default
-this edge is auto-detected as the latest `citing_date` found anywhere in
-the index; set `CORPUS_COVERAGE_END_DATE = "YYYYMMDD"` near the top of the
-file if you know your real `--download`/`--extract` range precisely. A
-floor (`CITATION_RATE_MIN_YEARS`, default `1.0`) prevents a division blowup
-for patents granted very recently.
+```
+python uspto_forward_citations_v5.py --sample 25 --all   # trial: scan 25 archives, then export
+python uspto_forward_citations_v5.py --all               # full scan + export (restartable)
+python uspto_forward_citations_v5.py --verify            # check how patent numbers matched
+```
 
-**Cohort Percentile.** Ranks each patent only against *other filtered
-patents* sharing its grant-year cohort (`CITATION_COHORT_YEAR_WINDOW`,
-default 5 years) — not against the whole USPTO corpus. Building a
-corpus-wide percentile would require indexing every citation edge in
-existence rather than just the ones landing on your target set, which is
-the exact scale problem the target-key filtering is designed to avoid.
-Cohorts smaller than `CITATION_COHORT_MIN_SIZE` (default 5) are left
-blank rather than reporting a percentile computed against 2–3 peers.
+Open `forward_citations.xlsx`: the most-cited patents are at the top, and the **Run Notes** sheet says what the run covered.
 
-**Caveats that don't go away:**
-- The citation-arrival curve is itself skewed — most patents peak roughly
-  3–6 years after grant, not on a straight line — so a flat per-year rate
-  is an approximation, not a true accumulation model.
-- Counts reflect only the corpus present in `EXTRACTED_DIR`. A `--sample`
-  run gives sample-scale numbers, not true totals.
-- A patent can only be cited by documents published *after* it.
-- Pre-grant applications usually carry no references-cited section at
-  publication, so citing documents are mostly grants.
+> **If the filter results change** (you edited the search workbooks and re-ran `--filter`), run `--reset` before scanning again. The index remembers which archives it has read, not which patents it was looking for, so it would otherwise skip archives that contain citations to the new patents.
 
-## Config reference
+---
 
-| Constant | Default | What it controls |
+## Before you run
+
+- **One setting must match the pipeline:** `BULK_DATA_ROOT_DIR = Path(r"D:\uspto_corpus")` at the top of the script. Every other path is derived from it.
+- **Run the pipeline first**, through at least `--filter`. Run `--classify` too if you want the patent type and claim category columns filled in.
+- **Keep `RAW\`** (the downloaded zip archives): the scan reads them directly. (`--source extracted` reads the unzipped copies instead.)
+- This script never writes to the pipeline's database, so running one can't break the other.
+
+---
+
+## What it does
+
+| Stage | Command | What happens |
 |---|---|---|
-| `SCAN_WORKERS` | `4` | Parallel file-scan threads. More than ~4 on an external HDD is usually slower (seek thrash); 8 is reasonable on an SSD. |
-| `EXCEL_PAIR_ROW_LIMIT` | `1,000,000` | Row cap on the "Citation Pairs" Excel sheet (Excel's hard limit is 1,048,576). The CSV never truncates. |
-| `EXCEL_CELL_CHAR_BUDGET` | `30,000` | Character budget per "Citing Patent IDs" cell before splitting into another column. |
-| `CORPUS_COVERAGE_END_DATE` | `None` (auto-detect) | Set to `"YYYYMMDD"` for a precise Citations Per Year denominator. |
-| `CITATION_COHORT_YEAR_WINDOW` | `5` | Grant-year bucket width for Cohort Percentile. |
-| `CITATION_COHORT_MIN_SIZE` | `5` | Minimum patents sharing a cohort before a percentile is reported. |
-| `CITATION_RATE_MIN_YEARS` | `1.0` | Floor on the Citations Per Year denominator. |
+| Scan | `--scan` | Reads every weekly archive (4,095 files, about 20 million records, 223 million cited references), extracts each record's US patent citations, and stores the ones that point to a selected patent in a citation index. Restartable: finished archives are skipped. |
+| Export | `--export` | Counts citations per selected patent, splits them by who added them, computes rates and percentiles, and writes the Excel and CSV results. |
+| Verify | `--verify` | Reports how patent numbers were matched and writes a per-patent match report. |
+| Both | `--all` | Scan, then export. |
 
-## Verified against real USPTO data
+**Where citations come from in each format:**
 
-- **SGML**: extraction hand-checked against two genuine uploaded grant
-  records — every citation, and the real `CITED-BY-EXAMINER`/
-  `CITED-BY-OTHER` tags, matched exactly.
-- **APS/Green Book**: hand-checked against a real 1976 reissue patent
-  (`RE0286710`) — correctly extracted all 8 genuine `UREF`/`PNO` citations
-  (including a real duplicate) while correctly *excluding* the `REIS`
-  section's own `PNO` (the original patent being reissued), which is a
-  different field in a different section, not a cited reference. Also
-  confirmed the APS check-digit round trip end-to-end against this same
-  file.
-- **XML**: hand-checked against a real granted design patent
-  (`USD0707016S1`) with 21 genuine citations — all 21 extracted correctly,
-  including design-patent (`D`-prefixed) cite numbers and the real
-  `cited by examiner` category tag.
-- **Rate/percentile math**: verified against a controlled synthetic set
-  with known citation counts (0/1/2/3/4/5 across one cohort) — resulting
-  percentiles matched hand-calculated values exactly (16.7/33.3/50.0/
-  66.7/83.3/100.0).
+| Format | Citations read from | Who added the citation? |
+|---|---|---|
+| XML (2002–present grants, applications) | `<us-references-cited>` / `<references-cited>` | Recorded: examiner, applicant or third party |
+| SGML (2001 grants) | `B561` patent-citation blocks | Partly: examiner or "other" (not assumed to mean applicant) |
+| APS (1976–2001 grants) | `UREF` sections | Not recorded: reported as unknown |
 
-Not yet confirmed against real data: an SGML `CITED-BY-OTHER` citation's
-true real-world meaning, and an XML citation actually carrying
-`cited by applicant` or `cited by third party` (every real record seen so
-far uses `cited by examiner`).
+Only US patent citations count; foreign patents and non-patent literature can't match a US patent number. Only the first part of each record is read (bibliographic data and citations always come before the long description), which keeps the scan fast.
+
+**Number matching.** The script normalises every number format the pipeline stores (`US10123456B2`, `US06167569A`, `USD0435713S`, `USPP011728P`, `USRE038552E1`...). APS-era numbers carry an extra check character (`US039302711` is patent 3,930,271); it's removed for APS records, and both readings are tried where the source isn't certain. `--verify` shows which reading matched.
+
+---
+
+## What you get
+
+All in `D:\uspto_corpus\RESULTS\FORWARD CITATIONS\` unless noted.
+
+| File | What it is |
+|---|---|
+| `forward_citations.xlsx` | **Forward Citations** sheet: one row per selected patent, most-cited first. **Pairs** sheets: every citing/cited pair, one sheet per format, continuing onto "(2)" sheets past 1 million rows. **Run Notes**: what the run covered, the coverage year, caveats and counts per claim category. |
+| `forward_citation_pairs.csv` | Every citing/cited pair in one file: the complete record (3.5 million rows; too large for Excel). |
+| `forward_citation_pairs_<format>.csv` | The pairs split by format (`aps`, `sgml`, `xml`, `appxml`), with `_part2`, `_part3`... files so each one opens in Excel. |
+| `forward_citation_match_report.csv` | From `--verify`: how each patent's number matched. |
+| `D:\uspto_corpus\DATABASE\FORWARD_CITATIONS.sqlite` | The citation index (restart state). Delete it only with `--reset`. |
+
+### Reading the Forward Citations sheet
+
+| Column | Meaning and how to use it |
+|---|---|
+| Filtered Patent ID, Title, Grant Date, Assignee, CPC | The selected patent, from the filter results. |
+| Patent Type, Claim Category, Independent Claim Categories | From the pipeline's `--filter` / `--classify` (blank claim category = results filtered before v15.10; run `--classify`, then `--export` again). |
+| **Times Cited** | Number of later US documents citing it. Higher means more influence, but older patents have had longer to collect citations. |
+| **Citations Per Year** | Times Cited ÷ years since grant. Compares patents of different ages. |
+| **Cohort Percentile** | Rank against the other selected patents granted in the same 5-year window: 95 means cited more than 95% of its peers. The fairest single score. Blank when the date didn't parse or fewer than 5 patents share the window. |
+| Cited by Applicant | Added by the later patent's own applicant: a deliberate reference and the strongest signal. |
+| Cited by Examiner | Added by the patent examiner during the search; common and less meaningful. |
+| Cited by Other/Unknown | SGML-era "other" citations, plus all APS-era citations (which don't record who added them). |
+| Citing Patent IDs | The citing patents, split over several columns when the list exceeds Excel's 32,767-character cell limit. |
+
+### Reading the pairs files
+
+One row per citation: `filtered_patent_number`, `filtered_patent_type`, `filtered_claim_category`, `canonical_key` (normalised number used for matching), `citing_patent_number`, `citing_patent_type`, `citing_patent_date`, `citation_category` (applicant / examiner / other / unknown), `filtered_patent_title`. Use them to see *who* cites a patent, or to build your own year-by-year citation curves.
+
+---
+
+## Checking a run
+
+- **Console:** the scan prints records read, references read, hits and files with errors; the export prints the time per step and how many patents got a rate and a percentile.
+- **`FORWARD_CITATIONS.sqlite` → `scanned_files` table:** one row per archive with records, citations seen, hits and any error. Files with an error are retried automatically on the next `--scan`.
+- **Run Notes sheet:** confirms the input file, coverage year and totals.
+- **`--verify`:** run it after a full scan to confirm number matching worked.
+
+Current state: 4,095 archives scanned with no errors; 3,512,368 citations to 292,706 of 474,183 selected patents.
+
+---
+
+## Need to know: assumptions and limits
+
+- **US citations only.** Citations from foreign patents aren't in USPTO data.
+- **Only the corpus on the drive counts.** A `--sample` run gives sample-sized numbers, not real totals.
+- **Recent patents look less cited** because they've had little time. Use Citations Per Year or Cohort Percentile for them.
+- **Published applications rarely carry a citation list**, so almost all citing documents are granted patents.
+- **The per-year rate is an approximation.** Most patents collect citations fastest 3–6 years after grant, not at a steady rate.
+- **Percentiles are relative to the selected patents only**, not to all of USPTO. Indexing every citation in the corpus would be far larger.
+- **Rates use the latest citing year in the data as "now"** (auto-detected). Set `CORPUS_COVERAGE_END_DATE = "YYYYMMDD"` if you know the exact end of your downloaded data.
+- **Re-run `--reset` + `--scan` whenever the filter results change** (see Quick start).
+
+---
+
+## Command reference
+
+| Command | Does |
+|---|---|
+| `--scan` | Build or continue the citation index |
+| `--export` | Write the Excel and CSV results from the index |
+| `--all` | Scan + export |
+| `--sample N` | Scan only the next N unscanned archives (combine with `--all` for a trial) |
+| `--verify` | Report how numbers matched; write the match report |
+| `--reset` | Delete the citation index and start over |
+| `--source zip\|extracted` | Read the zip archives (default, much faster on a spinning drive) or the unzipped files |
+| `--workers N` | Scan processes (default 4) |
+| `--skip-excel-pairs` | Leave the pairs sheets out of the workbook: the fastest export (the CSVs still have every pair) |
+
+### Settings (top of the script)
+
+| Setting | Default | Controls |
+|---|---|---|
+| `SCAN_WORKERS` | 4 | Scan processes. More than about 4 on a spinning drive is usually slower; 8 is reasonable on an SSD. |
+| `SCAN_SOURCE` | `"zip"` | Read archives directly (`zip`) or the unzipped files (`extracted`) |
+| `EXCEL_PAIR_ROW_LIMIT` | 1,000,000 | Rows per pairs sheet / pairs CSV part (Excel's limit is 1,048,576) |
+| `EXCEL_INCLUDE_PAIRS_SHEET` | True | Include pairs sheets in the workbook |
+| `EXCEL_CELL_CHAR_BUDGET` | 30,000 | Characters per Citing Patent IDs cell before starting another column |
+| `CORPUS_COVERAGE_END_DATE` | None (auto) | End of the data, for the per-year rate |
+| `CITATION_COHORT_YEAR_WINDOW` | 5 | Width of the grant-year windows for Cohort Percentile |
+| `CITATION_COHORT_MIN_SIZE` | 5 | Smallest window that gets a percentile |
+| `CITATION_RATE_MIN_YEARS` | 1.0 | Minimum years used in the per-year rate (stops very new patents getting huge rates) |
+
+---
+
+## How it was checked
+
+- **SGML:** two real grant records checked by hand; every citation and its examiner/other tag matched.
+- **APS:** a real 1976 reissue patent checked by hand; all 8 citations found, and the reissued patent's own number (a different field) correctly not counted. The check-digit handling was confirmed on the same file.
+- **XML:** a real design patent with 21 citations checked by hand; all 21 found, with the correct category.
+- **Rates and percentiles:** checked against a synthetic set with known answers.
+- Not yet confirmed on real data: what SGML "other" citations really mean, and real XML "applicant" or "third party" tags in a hand-checked record (the full run does report many applicant citations).
+
+## Version history
+
+| Version | Change |
+|---|---|
+| v5.1 | Patent type, claim category and citing patent type columns; reads `RESULTS\FILTERED`, writes `RESULTS\FORWARD CITATIONS` |
+| v5 | Pairs split by format into Excel sheets and CSV parts, nothing truncated |
+| v4 | Much faster Cohort Percentile; `--skip-excel-pairs`; step timings |
+| v3 | Reads zip archives directly (5–10× less disk reading); worker processes; ignores extraction marker files |
+| v2 | APS check character always removed; duplicate APS/SGML patents reported once; merged XML records split correctly |
+| v1 | First offline version, replacing PatentsView |

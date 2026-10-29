@@ -1,82 +1,204 @@
-# tds_crawler_v1 — vendor technical data sheet harvester
+# Supplier Data-Sheet Crawler (`tds_crawler_v1.py`)
 
-Crawls every vendor in `Vendors_With_Technical_Sheets_By_Material_Category.xlsx`, collects the PDF links on each site, downloads the data sheets, and tags each one by document type and by the test methods it cites.
+Visits the websites of the suppliers listed in the vendor workbook, finds the PDFs they publish (technical data sheets, safety data sheets, brochures, processing guides...), downloads them, and sorts them by material category, supplier, document type and language. The result is a browsable library of what suppliers say about their films, foils, nonwovens, papers, converting materials and machines.
 
-## Files
-
-| File | Purpose |
+| | |
 |---|---|
-| `tds_crawler_v1.py` | The crawler (Python 3.9+) |
-| `vendor_seeds.csv` | Domains and start URLs for each vendor. **Edit this file**, not the script |
-| `README_tds_crawler_v1.md` | This file |
-| `requirements.txt` | Dependencies |
+| **Input** | `D:\tds_corpus\input\Vendors_With_Technical_Sheets_By_Material_Category.xlsx` (the supplier list) and `D:\tds_corpus\input\vendor_seeds.csv` (how to crawl each one) |
+| **Main output** | `D:\tds_corpus\pdfs\<Category>\<Vendor>\` and the clickable catalog `D:\tds_corpus\tds_catalog.xlsx` |
+| **Run time** | Days for every supplier; run it in batches with `--vendors` |
+| **Depends on** | Nothing else in the project. The [overview report](README_overview_report_v1.md) reads its results. |
 
-The script looks for the workbook and seed file in `D:\tds_corpus\input\` (`DEFAULT_WORKBOOK` and `DEFAULT_SEEDS` near the top of the script). Override them with `--workbook PATH` and `--seeds PATH`.
+---
 
-## Which version ran?
+## Why it works this way
 
-The first log line of every run shows the build, the rules version and the full path of the script that ran, for example `tds_crawler_v1 build 2026-10-25 r22 (rules v12) - C:\...\tds_crawler_v1.py`. Browsers often save a re-downloaded file as `tds_crawler_v1 (1).py`, so check that line after replacing the script. Whenever the sorting rules change, `--classify` (or `--all`) re-checks every file automatically. A run without `--classify` warns if files were sorted by older rules.
+- **Suppliers, not search engines.** Data sheets live on each supplier's own site, in very different layouts, so the crawler follows links from each supplier's start pages and also reads document libraries' APIs where a site loads its files with JavaScript.
+- **Keep everything on-topic, not just data sheets.** Safety data sheets, brochures, selector guides and processing guides are kept because they describe the materials. Company paperwork (annual reports, codes of conduct, purchase terms, plant certificates) is removed.
+- **English first.** Where a supplier publishes the same sheet in several languages, the English one goes in the main folder and the others are set aside in `_translations`.
+- **Nothing is lost silently.** Deleted off-topic files are logged with their source address; unreadable files go to `_rejected`; the same file reached from several links is stored once.
+- **Polite.** It obeys robots.txt, waits between requests, backs off when a site is busy, and identifies itself.
 
-## Install
-
-```
-pip install -r requirements.txt
-python -m pip install cryptography    # needed to read encrypted PDFs (many Sika sheets)
-# optional, for JavaScript-heavy sites (Dow, ExxonMobil, SABIC, 3M, Henkel...):
-python -m pip install playwright
-```
-
-That is all `--js` needs: the script uses Microsoft Edge or Google Chrome from your PC. `python -m playwright install chromium` is optional, and only needed if neither browser is installed. Use `python -m ...` rather than plain `pip` or `playwright`, so the package goes into the same Python that runs the script. A run with `--js` logs `JavaScript rendering: using Microsoft Edge` (or similar) when it works. If it can't start a browser, it says why and carries on without JavaScript.
-
-## Long runs: is it frozen?
-
-Every 5 minutes the log prints a "Still working" block naming what each worker is doing and for how long (a page, a PDF, a file being classified). A quiet stretch with those lines is a slow site, not a freeze; sites that ask for long pauses in robots.txt (Barmag: 60 s) are the usual cause. A single PDF download is abandoned after 5 minutes and retried on the next run, and guessed English URLs are skipped on such slow sites.
-
-Ctrl-C works at once: the first press finishes the current requests and saves state (seconds, at most about a minute); a second press quits immediately. Either way the database stays consistent, and re-running the same command continues where it stopped.
-
-## Recommended run order (stage and validate)
+## Quick start
 
 ```
-python tds_crawler_v1.py --list-vendors                       # check seed status per vendor
+python -m pip install -r requirements.txt                     # includes cryptography for encrypted PDFs
+python tds_crawler_v1.py --list-vendors                       # suppliers, categories and seed status
 python tds_crawler_v1.py --discover --vendors "rogers,camden,novelis" --max-pages 60 --contact you@example.com
-python tds_crawler_v1.py --status                              # links found per vendor and type, nothing downloaded yet
+python tds_crawler_v1.py --status                              # links found per supplier and type (nothing downloaded yet)
 python tds_crawler_v1.py --download --classify --export --vendors "rogers,camden,novelis"
-python tds_crawler_v1.py --all --contact you@example.com       # full run, all crawlable vendors
-python tds_crawler_v1.py --all --js                            # add Playwright for render_js=1 vendors
 ```
 
-Running `--discover` on its own is the dry run: it lists every PDF link and how each was classified, without downloading anything.
+Open `D:\tds_corpus\tds_catalog.xlsx` and check the documents look right. Then crawl everyone:
 
-## Output (default root `D:\tds_corpus`, change it with `--root`)
+```
+python tds_crawler_v1.py --all --contact you@example.com       # discover + download + classify + export
+python tds_crawler_v1.py --all --js --contact you@example.com  # also render JavaScript-heavy sites (render_js=1)
+```
 
-Every vendor in the workbook gets its folder under `pdfs\<Category>\` on every run, even before anything is downloaded, so an empty folder means that vendor has no files yet (see `--status` for why).
+`--discover` on its own is a dry run: it lists every PDF link and how it was classified without downloading anything. Ctrl-C is safe at any time (see [Long runs](#long-runs-is-it-frozen)); the same command continues where it stopped.
+
+---
+
+## Before you run
+
+### Files
+
+| File | Where | Purpose |
+|---|---|---|
+| `tds_crawler_v1.py` | this repository | The crawler |
+| `Vendors_With_Technical_Sheets_By_Material_Category.xlsx` | `D:\tds_corpus\input\` | The supplier list: one sheet per material category, plus a reference guide |
+| `vendor_seeds.csv` | `D:\tds_corpus\input\` | One row per supplier: where and how to crawl. **Edit this file, not the script**, to change a supplier ([columns](#editing-vendor_seedscsv)) |
+| `requirements.txt` | this repository | Packages to install |
+
+The script looks for the workbook and seed file at `DEFAULT_WORKBOOK` and `DEFAULT_SEEDS` near the top (both in `D:\tds_corpus\input\`), and writes to `DEFAULT_ROOT` (`D:\tds_corpus`). Override with `--workbook`, `--seeds` and `--root`. A supplier in the workbook without a seed row gets one added automatically with `status=skip` until you fill in its website.
+
+### Install
+
+```
+python -m pip install -r requirements.txt
+python -m pip install playwright        # optional: only for --js
+```
+
+- **`cryptography`** (in requirements.txt) lets the crawler read encrypted PDFs, which many suppliers publish (many Sika sheets). Without it they can't be read and go to `_rejected`.
+- **`--js`** uses the Microsoft Edge or Google Chrome already on the PC; `python -m playwright install chromium` is only needed if neither is installed. A working run logs `JavaScript rendering: using Microsoft Edge`; if no browser starts, it says why and carries on without JavaScript.
+- Use `python -m pip ...` rather than plain `pip`, so packages go into the Python that runs the script.
+
+### Which version ran?
+
+The first log line of every run shows the build, the rules version and the path of the script, e.g. `tds_crawler_v1 build 2026-10-25 r22 (rules v12) - C:\...\tds_crawler_v1.py`. Browsers often save a re-downloaded file as `tds_crawler_v1 (1).py`, so check that line after replacing the script. When the sorting rules change (the rules version goes up), `--classify` re-checks every file automatically; a run without `--classify` warns that files were sorted by older rules.
+
+---
+
+## What it does
+
+| Stage | Command | What happens |
+|---|---|---|
+| Discover | `--discover` | Reads each supplier's robots.txt and sitemaps, reads document APIs where available, then follows links from the start pages (most promising first) and records every PDF link with a type guessed from its address and link text. |
+| Download | `--download` | Downloads the PDF links of the wanted types (by default everything except corporate documents). Keeps only real PDFs, skips files over 50 MB, and stores identical files once (SHA-256). |
+| Classify | `--classify` | Reads the first pages of each new file: document type, title, page count, language, test methods cited. Deletes off-topic files (logged), moves foreign copies to `_translations` and unreadable files to `_rejected`. |
+| Export | `--export` | Writes `tds_manifest.csv` and `tds_catalog.xlsx`. |
+| Everything | `--all` | Discover → download → classify → export. |
+
+Current corpus: 65 suppliers crawled (75,802 pages, 97,249 PDF links), 12,905 documents kept (9,062 technical data sheets), 1,950 foreign-language copies, 132 rejected; 13.8 GB.
+
+---
+
+## What you get
 
 ```
 D:\tds_corpus\
-  input\                   workbook + vendor_seeds.csv
-  pdfs\<Category>\<Vendor>\*.pdf   e.g. pdfs\4_Polymer_Films\Toray_Industries\  (SHA-256 de-duplicated)
-  pdfs\<Category>\<Vendor>\_translations\   foreign-language copies whose English version is in the folder above
-  pdfs\<Category>\<Vendor>\_rejected\       files that could not be judged, or off-topic files when --keep-off-topic is used
-  tds_crawler.db            SQLite (WAL): pages, pdf_links, files, vendors
-  tds_manifest.csv          one row per file: vendor, categories, title, doc type, test methods, source URL...
-  tds_catalog.xlsx          Excel catalogue: Summary + one sheet per category (Vendor | Document (click to open) |
-                            Description | Type | Test methods | Pages | Language | Source URL) + Translations + Rejected
-  logs\tds_crawler_YYYYMMDD.log
-  logs\deleted_off_topic_YYYYMMDD.csv   every off-topic file deleted, with its source URL
+  input\                                     workbook + vendor_seeds.csv
+  pdfs\<Category>\<Vendor>\*.pdf             kept documents, e.g. pdfs\4_Polymer_Films\Toray_Industries\
+  pdfs\<Category>\<Vendor>\_translations\    foreign-language copies (English version in the folder above, if found)
+  pdfs\<Category>\<Vendor>\_rejected\        files that couldn't be judged (or off-topic, with --keep-off-topic)
+  tds_catalog.xlsx                           clickable Excel catalog
+  tds_manifest.csv                           one row per file, every detail recorded
+  tds_crawler.db                             crawl state (pages, PDF links, files, suppliers)
+  logs\tds_crawler_YYYYMMDD.log              daily run log
+  logs\deleted_off_topic_YYYYMMDD.csv        every off-topic file deleted, with its source address
 ```
 
-Category folders come from the workbook sheet names: `1_Foil_Materials`, `2_Nonwoven_Fabrics`, `3_Specialty_Paper`, `4_Polymer_Films`, `5_Web_Converting`, `6_Equipment_Machinery`, `7_Process_Technology`. A company listed on more than one sheet (Dow, ExxonMobil, Oerlikon, Brückner) goes in the first sheet's folder, and `tds_manifest.csv` lists all of its categories. To choose a different folder for a company, fill in its `folder` column in `vendor_seeds.csv`. Files downloaded in an older layout are moved automatically on the next `--download`, or by running `--reorganize` on its own.
+Category folders come from the workbook's sheet names (`1_Foil_Materials` ... `7_Process_Technology`; DuPont's seed row sends it to `8_Multi_Category` through the `folder` column). A company on several sheets (Dow, ExxonMobil, Oerlikon, Brückner) goes in its first sheet's folder; the manifest lists all its categories. Set the `folder` seed column to choose a different one. Every supplier gets a folder even before anything is downloaded, so an empty folder means nothing collected yet (`--status` says why). Files in an older layout are moved automatically by `--download` or `--reorganize`.
 
-## Excel catalogue
+### The catalog (`tds_catalog.xlsx`)
 
-`--export` (and `--all`) also writes `tds_catalog.xlsx` in the corpus root. It has these sheets:
+- **Summary:** per material category, the number of suppliers, documents, translations and rejected files. Click a category to jump to its sheet.
+- **One sheet per category:** one row per kept PDF with Vendor, Document (click to open the PDF), Description (built from the document's opening text, e.g. *Technical data sheet: DuPont Pyralux AG - All-Polyimide Double-Sided Copper-Clad Laminate*), Type, Test methods, Evidence, Pages, Language and Source URL.
+- **Translations:** every foreign-language copy and its English version's file name, or `NOT FOUND`.
+- **Rejected:** files set aside, with the reason.
 
-- **Summary:** one row per material category, with counts of suppliers, documents, translations and rejected files. Click a category name to jump to its sheet.
-- **One sheet per category** (`1 Foil Materials`, `2 Nonwoven Fabrics`, `4 Polymer Films`, ... `8 Multi Category`): one row per kept PDF, with Vendor, Document, Description, Type, Test methods, Pages, Language and Source URL. The file name is a link, so clicking it opens the PDF. The description is built from the document's opening text, for example *Technical data sheet: DuPont Pyralux AG - All-Polyimide Double-Sided Copper-Clad Laminate*.
-- **Translations:** every non-English copy, with its category and the English version's file name, or `NOT FOUND`.
-- **Rejected:** files kept aside (unreadable, or off-topic with `--keep-off-topic`), with the reason.
+Keep the catalog in `D:\tds_corpus` so the links work. If it's open in Excel during a run, a time-stamped copy is written instead.
 
-Keep the workbook in the corpus root so the links work. If it's open in Excel during a run, a time-stamped copy is written instead.
+### The manifest (`tds_manifest.csv`)
+
+| Column | Meaning |
+|---|---|
+| `vendor`, `categories`, `category_folder`, `path` | Supplier, its material categories, and where the file is |
+| `bytes`, `pages`, `title`, `language` | File details read from the PDF. Language is `en`, `de`, `zh`, `ja`..., or e.g. `ja+en` for bilingual sheets |
+| `is_translated_copy`, `english_version` | `yes` for a foreign copy, with the English file's name or `NOT FOUND` |
+| `rejected_as` | Why a file is in `_rejected` (blank if kept) |
+| `tech_score`, `evidence` | How technical the document looks and the evidence found (units, property names, test methods, headings) |
+| `doc_type_from_text`, `doc_type_from_link` | Type read from the PDF text (`tds`, `sds`, `brochure`, `certificate`, `corporate`, `commercial`, `other`, `unreadable`) and guessed from the link |
+| `test_methods`, `method_families` | Standards cited, e.g. `ASTM D882; ISO 527`, and their families. Use the families to separate film, paper and nonwoven data before comparing values. |
+| `source_url`, `anchor_text`, `found_on_page` | Where the file came from |
+| `server_last_modified`, `downloaded_at` | Dates, for refreshing |
+| `urls_with_same_file`, `sha256` | How many links led to this file, and its fingerprint |
+
+---
+
+## Checking a run
+
+| Where | What to look at |
+|---|---|
+| `--status` | Per supplier: pages crawled, links by type and state, files kept. The first place to look when a supplier has nothing. |
+| `logs\tds_crawler_YYYYMMDD.log` | The first line (version). `WARNING`/`ERROR` lines. "Still working" blocks every 5 minutes on long runs. |
+| `logs\deleted_off_topic_YYYYMMDD.csv` | Every deleted file (`deleted_at`, `vendor`, `reason`, `path`, `source_url`, `sha256`). Skim it after a classify run to be sure nothing useful was removed. |
+| `tds_catalog.xlsx` → Rejected / Translations | Files set aside and why; translations with no English version. |
+| `tds_crawler.db` | Full state. Table `pdf_links` has every link and its outcome (below). |
+
+**What happens to PDF links** (the `state` column of `pdf_links`):
+
+| State | Meaning |
+|---|---|
+| `downloaded` | Saved as a new file |
+| `duplicate` | Same file as one already saved from another link |
+| `unchanged` | Re-checked with `--refresh`; not changed |
+| `pending` | Found but not downloaded (type not wanted, or not reached yet) |
+| `off_topic` | Judged off-topic from its address or link text; never downloaded |
+| `deleted` | Downloaded, then deleted as off-topic or out of scope (logged) |
+| `translation` | A foreign-language copy |
+| `guess_failed` | An English-version address the crawler guessed didn't exist (or the site was too slow to try) |
+| `error`, `robots`, `not_pdf`, `too_large` | Download failed, blocked by robots.txt, not a PDF, or over the size limit |
+
+### Long runs: is it frozen?
+
+Every 5 minutes the log prints a "Still working" block naming what each worker is doing and for how long (a page, a PDF, a file being classified). A quiet stretch with those lines is a slow site, not a freeze; sites whose robots.txt asks for long pauses (Barmag: 60 s) are the usual cause. A single PDF download is abandoned after 5 minutes and retried next run, and guessed English addresses are skipped on such slow sites.
+
+Ctrl-C works at once: the first press finishes the current requests and saves state (seconds, at most about a minute); a second press quits immediately. Either way the database stays consistent.
+
+---
+
+## Need to know: assumptions and limits
+
+- **Public PDFs only.** Documents behind logins, request forms or search boxes aren't collected (e.g. Qnity's safety data sheets). Some sites block crawlers entirely. In the current run 8 suppliers yielded nothing: Asahi Kasei, IMS Technologies, Sappi, Stora Enso (blocked or erroring), Huntsman, Innovatec (links found, nothing kept), Krahn Chemie, Schuler (no reachable PDF links).
+- **Check site terms.** Some suppliers' terms forbid automated download (Prospector-style portals, 3M). Use `--contact` so site owners can reach you, and don't raise the request rate.
+- **"On-topic" is decided by rules**, built from the project's topic list and three manual audits (October 2026). They're strict about company paperwork and lenient about product documents; read [What is kept](#what-is-kept-the-topic-decides) before relying on completeness. Use `--keep-off-topic` to move rather than delete.
+- **Document type and language are read from the PDF text.** Scanned (image-only) PDFs can't be read and are labelled `unreadable`; encrypted PDFs need `cryptography`.
+- **The first 2 pages decide the document type; the first 6 decide the topic.** A data sheet with a long cover section may be typed as a general technical document.
+- **Websites change.** Re-running finds new documents; `--download --refresh` re-checks existing ones (a changed sheet is saved as a new file and the old one kept).
+- **Your manual changes are respected.** Move a PDF yourself and the crawler finds its new location; delete one and it isn't downloaded again. If a large share of files seem missing (e.g. the drive isn't connected), nothing is changed.
+
+---
+
+## Command reference
+
+| Command / option | Does |
+|---|---|
+| `--list-vendors` | Show suppliers, categories and seed status |
+| `--discover` | Crawl sites and collect PDF links (dry run) |
+| `--download` | Download pending links (`--refresh` also re-checks downloaded files for changes) |
+| `--classify` | Sort new files (`--reclassify` re-checks all files) |
+| `--export` | Write the manifest and catalog |
+| `--all` | Discover + download + classify + export |
+| `--status` | Print per-supplier counts |
+| `--reorganize` | Move existing files into the category/vendor layout |
+| `--vendors "a,b"` / `--categories "foil,paper"` / `--only-ok` | Limit which suppliers run (name substring / workbook sheet / seed status `ok` only) |
+| `--max-pages N` (400), `--max-depth N` (4) | Crawl limits per supplier per run (a seed's `max_pages` overrides) |
+| `--delay S` (2.0), `--workers N` (4) | Seconds between requests per supplier; suppliers crawled in parallel |
+| `--doc-types` | Link types to download: `tds,sds,brochure,certificate,other` by default, or `all` |
+| `--max-pdf-mb N` (50), `--max-attempts N` (3) | Size limit; attempts before giving up on a PDF |
+| `--recrawl` | Redo discovery for suppliers already finished |
+| `--js` | Render `render_js=1` suppliers in a browser |
+| `--search-seed` | Add search-engine results (needs `SERPAPI_KEY`, or `GOOGLE_CSE_KEY` + `GOOGLE_CSE_CX`) |
+| `--no-wp-media`, `--no-sitemaps`, `--no-offsite-pdfs` | Turn off the WordPress media API, sitemaps, or PDFs hosted on other domains |
+| `--keep-translations`, `--keep-off-topic`, `--keep-rejected` | Turn off language sorting / delete off-topic (move to `_rejected` instead) / all sorting |
+| `--contact EMAIL` | Added to the User-Agent (recommended) |
+| `--workbook`, `--seeds`, `--root` | Override input and output locations |
+
+---
+
+# Detailed behaviour
 
 ## Foreign-language documents (English first)
 
