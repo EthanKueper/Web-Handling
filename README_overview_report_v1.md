@@ -36,14 +36,24 @@ forward-citations `--export`.
 
 ## `overview_report.xlsx`
 
+Written for someone opening it for the first time. Every analysis sheet has the
+same layout: a title and one-line summary, then sections that each have a blue
+title band, a grey line saying in plain words what the section shows, a yellow
+**Takeaway** line computed from the data, and the table on the left with its
+chart beside or below it. Hover over a column heading marked with a red corner
+for what that column counts. Each sheet links back to Start Here.
+
 | Sheet | Contents |
 |---|---|
-| Patents | Bar chart of patents by decade, stacked by claim category; bar chart of patents by claim category; bar chart of filter results by file type (APS / SGML / XML grants / Applications); table of the top 10 patents by forward citations (title, assignee, year, type, claim category, times cited, applicant / examiner / other split); line chart of patents per year, grants vs applications; top 15 CPC subclasses with share of the corpus, forward citations and a short title |
-| Citations | How often filtered patents are cited (0, 1–5, 6–20, 21–100, 101–500, over 500); top 10 by citations per year (patents with at least 10 citations, so new patents moving fast show up); average citations per patent by claim category; the documents citing your patents, by type (utility, design, application …) |
-| Crawl | Headline numbers (vendors, pages crawled, PDF links, files downloaded, kept / translations / rejected, pages, size), PDF links by download outcome, charts of documents by material category, by document type, top 15 vendors, test-method families and language; a material category × document type table; every vendor with no kept documents and the likely reason (skipped in seeds, not crawled, site blocked, no PDF links, downloads failed, all rejected, only translations, off-topic) |
-| Vendors | One row per vendor: seed status, pages crawled, PDF links found / downloaded / errored, documents kept by type (TDS / SDS / other), translations, rejected, total PDF pages, size, last download. Filterable. |
-| Vendors & Patents | Crawled vendors matched to patent assignees by name: top 15 by patents (chart), then every match with documents kept, patents (grants / applications), patents cited, total citations, most-cited patent, and the assignee names that matched |
-| Notes | Sources read, when, and how each number was counted |
+| Start Here | Key numbers as tiles, a guide to every sheet (click a name to go there), a glossary of the terms used, and what's in the two copied folders |
+| Patents | Patents by decade; patents by decade split by claim category; patents by claim category; patents by file type (APS / SGML / XML grants / Applications); top 10 patents by forward citations; patents per year, grants vs applications; top 15 CPC subclasses |
+| Citations | How often filtered patents are cited; top 10 fastest-cited patents (citations per year, at least 10 citations); average citations per patent by claim category; what kinds of documents cite them |
+| Crawl | Headline numbers; what happened to each PDF link; documents by material category, type, top 15 vendors, test-method family and language; material category × document type table; vendors with no kept documents and the likely reason |
+| Vendors | One filterable row per vendor with crawl and document counts (data bar on Documents kept) |
+| Vendors & Patents | Crawled vendors matched to patent assignees by name: top 15 chart, then every match with data sheets and patents side by side and the assignee names matched |
+| How It Was Counted | Sources read and the counting rules |
+
+Claim categories keep the same colour in every chart.
 
 How things are counted:
 
