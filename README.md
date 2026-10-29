@@ -1,129 +1,116 @@
-# Web Films — Patent & Technical Data Corpus Tools
+# Web Films Research Corpus
 
-Python tools for building a research library on **web handling, web converting, polymer films, foil, nonwoven fabrics and paper processes**. The repository contains three scripts:
+Python tools that build an offline research library for **web handling, web converting, polymer films, foil, nonwovens and paper**:
 
-| Script | What it builds | Detailed docs |
+- **Every relevant US patent and published application from 1976 to today**, selected from USPTO's own bulk data, with the PDFs, a measure of how influential each patent is, and what each one claims (a process, a machine, a product...).
+- **The technical data sheets published by suppliers** of those materials and machines, collected from their websites and sorted by material, supplier, document type and language.
+- **One Excel overview** that summarises both, written for someone seeing the data for the first time.
+
+Everything runs on a Windows PC and writes to an external hard drive. Nothing depends on a paid service or a third-party search site.
+
+> **New here?** If you only want to *use* the data, you don't need to run any code: open `D:\OVERVIEW\overview_report.xlsx` (start on the **Start Here** tab) and read `D:\OVERVIEW\Web_Films_Project_Summary.docx`. This README is for running or changing the code.
+
+---
+
+## The four programs
+
+| # | Program | What it does | README |
+|---|---|---|---|
+| 1 | [`uspto_patent_pipeline_v15.py`](uspto_patent_pipeline_v15.py) | Downloads USPTO bulk patent data, builds a local database, selects the patents matching a CPC-code + keyword search matrix, labels what each one claims, and downloads their PDFs. | [README_pipeline_v15.md](README_pipeline_v15.md) |
+| 2 | [`uspto_forward_citations_v5.py`](uspto_forward_citations_v5.py) | Finds every later patent that cites each selected patent, so you can rank them by influence. | [README_forward_citations_v1.md](README_forward_citations_v1.md) |
+| 3 | [`tds_crawler_v1.py`](tds_crawler_v1.py) | Crawls supplier websites and collects their technical data sheets and related documents. | [README_tds_crawler_v1.md](README_tds_crawler_v1.md) |
+| 4 | [`overview_report_v1.py`](overview_report_v1.py) | Reads the results of 1–3 and builds the overview workbook and folder. | [README_overview_report_v1.md](README_overview_report_v1.md) |
+
+```
+ Search-matrix workbooks ─┐
+ (CPC codes + keywords)   ▼
+ USPTO bulk data ──► 1. Patent pipeline ──► filtered patents + PDFs ──► 2. Forward citations ─┐
+                                                                                             ├─► 4. Overview report
+ Vendor workbook ─┐                                                                          │     (D:\OVERVIEW)
+ vendor_seeds.csv ┴──► 3. Data-sheet crawler ──► supplier documents + catalog ───────────────┘
+```
+
+Programs 1 → 2 → 4 must run in that order. Program 3 is independent and can run any time before 4.
+
+---
+
+## Quick start
+
+1. **Install Python 3.9 or newer** (developed in PyCharm on Windows) and the packages:
+   ```
+   python -m pip install -r requirements.txt
+   ```
+2. **Connect the hard drive as `D:`**, or change the folder settings at the top of each script (each README says which ones).
+3. **Get a free USPTO API key** from the [USPTO Open Data Portal](https://data.uspto.gov/) and set it (only the patent download step needs it):
+   ```
+   $env:USPTO_API_KEY="your-key"        # PowerShell, current window only
+   ```
+4. **Try each program small before running it in full.** Every README has a "Quick start" with a small trial run. All four can be stopped (Ctrl-C) and restarted: finished work is skipped.
+
+| To... | Run |
+|---|---|
+| Check the USPTO connection | `python uspto_patent_pipeline_v15.py --test` |
+| Build the patent corpus (days) | `python uspto_patent_pipeline_v15.py --all` |
+| Add influence data (hours) | `python uspto_forward_citations_v5.py --all` |
+| Crawl suppliers (days, in batches) | `python tds_crawler_v1.py --all --contact you@example.com` |
+| Refresh the overview (minutes) | `python overview_report_v1.py` |
+
+---
+
+## What's on the hard drive
+
+| Folder | Made by | Contents |
 |---|---|---|
-| [`uspto_patent_pipeline_v15.py`](uspto_patent_pipeline_v15.py) | A CPC- and keyword-filtered library of USPTO patent PDFs (grants and applications, 1976 to present, 500,000+ patents scanned) | [`README_uspto_patent_pipeline_v15.md`](README_uspto_patent_pipeline_v15.md) |
-| [`uspto_forward_citations_v1.py`](uspto_forward_citations_v1.py) | Forward-citation counts and normalised importance metrics for the filtered patents, computed fully offline | [`README_uspto_forward_citations_v1.md`](README_uspto_forward_citations_v1.md) |
-| [`tds_crawler_v1.py`](tds_crawler_v1.py) | A classified library of vendor technical data sheets (TDS) for the same material categories | [`README_tds_crawler_v1.md`](README_tds_crawler_v1.md) |
+| `D:\uspto_corpus\input\` | you | The 8 search-matrix workbooks (CPC codes and keywords) |
+| `D:\uspto_corpus\RAW\`, `EXTRACTED\` | 1 | USPTO weekly archives, zipped and unzipped (re-downloadable) |
+| `D:\uspto_corpus\DATABASE\` | 1, 2 | Every parsed patent (one SQLite file per USPTO format) and the citation index |
+| `D:\uspto_corpus\RESULTS\FILTERED\` | 1 | **The selected patents** (`filtered_patents*.csv`) |
+| `D:\uspto_corpus\RESULTS\FORWARD CITATIONS\` | 2 | **Citation counts** (`forward_citations.xlsx`) and citing/cited pairs |
+| `D:\uspto_corpus\PDF\` | 1 | Patent PDFs (GRANTS, APPLICATIONS, OTHER) |
+| `D:\uspto_corpus\MANIFEST\`, `LOGS\` | 1 | Progress records and run log |
+| `D:\tds_corpus\` | 3 | Supplier documents (`pdfs\`), catalog (`tds_catalog.xlsx`), manifest, logs, audit records |
+| `D:\OVERVIEW\` | 4 | `overview_report.xlsx`, Excel-sized copies of the results, sample PDFs |
 
-This page is an overview. Each script's own README has the full command reference, options and output layout.
-
----
-
-## How the pieces fit together
-
-```
-                 Domain workbooks (CPC codes + keywords)
-                                  │
-USPTO bulk data ──► uspto_patent_pipeline_v15.py ──► SQLite DBs ──► candidate CSV ──► patent PDFs
-                                  │
-                                  ▼
-                   uspto_forward_citations_v1.py ──► citation counts, Citations Per Year,
-                                                     Cohort Percentile
-
-Vendor workbook + vendor_seeds.csv ──► tds_crawler_v1.py ──► technical data sheet PDFs + manifest
-```
-
-The two patent scripts are one workflow: the pipeline builds the parsed patent database and the filtered corpus, and the citations script ranks those patents by how often later patents cite them. The TDS crawler is independent; it covers the same material categories from the supplier side.
+Size: the patent database alone is about 310 GB, and a full rebuild needs well over 500 GB free. The supplier documents are about 14 GB.
 
 ---
 
-## 1. `uspto_patent_pipeline_v15.py` — patent corpus pipeline
+## Things everyone should know
 
-Downloads USPTO's official bulk data products, parses them into SQLite, filters by CPC classification **and** keywords, and retrieves the PDFs of the matching patents.
+These are the design decisions and limits that shape every number in the outputs. Each program's README has its own detailed list.
 
-**Data products**
-
-| Product | Format | Coverage |
-|---|---|---|
-| `PTGRAPS` | APS / Green Book | ~1976–1996 grants |
-| `PTGRSGM` | SGML | ~1996–2001 grants |
-| `PTGRXML` | XML | ~2001–present grants |
-| `APPXML` | XML | ~2001–present applications |
-
-**Stages:** Download → Extract → Parse → SQLite database → CPC/IPC filter → Keyword filter → Candidate CSV → PDF retrieval
-
-**Key behaviour**
-
-- **Precision over breadth.** A patent must match both a CPC code *and* a keyword (AND logic).
-- **Excel-driven search terms.** CPC codes and keywords load from a folder of domain workbooks (web processes, web converting, web handling, nonwovens, foil, paper). Codes are normalised on load, including regular and non-breaking spaces, which otherwise cause silent filter misses.
-- **IPC fallback.** Pre-2013 patents often lack CPC codes; `MATCH_IPC_AS_CPC_FALLBACK = True` lets their IPC codes stand in.
-- **Per-product databases.** Each bulk product gets its own SQLite file (WAL mode, deferred index creation).
-- **Split downloads.** `--download-aps`, `--download-sgml`, `--download-xml` and `--download-appxml` let the multi-day bulk download be spread over several sessions.
-- **Parallel and resumable.** Parsing uses `ProcessPoolExecutor` with resumability through `database_manifest.csv`; PDF downloads use `ThreadPoolExecutor` with a download manifest.
-- **Split storage roots.** Bulk archives (re-downloadable, suited to HDD), databases, and the curated PDF library (suited to SSD) can live on different drives. Default root: `D:\uspto_corpus`.
-
-See [`README_uspto_patent_pipeline_v15.md`](README_uspto_patent_pipeline_v15.md) for the commands and configuration.
-
----
-
-## 2. `uspto_forward_citations_v1.py` — forward citations
-
-Counts how many times each patent is cited by later patents, using the locally parsed bulk data only. It replaces the PatentsView API, which shut down in March 2026.
-
-- Three format-specific citation extractors: XML, SGML and APS.
-- Records the citation category (examiner, applicant, other) and the citing patent's date.
-- Two normalised metrics to correct for the recency bias of raw counts:
-  - **Citations Per Year** — citations divided by years since grant.
-  - **Cohort Percentile** — the patent's rank against patents of the same cohort.
-
-Forward citations are a stronger signal of a patent's importance than backward citations, so this script is the main tool for prioritising reading within the filtered corpus.
-
-See [`README_uspto_forward_citations_v1.md`](README_uspto_forward_citations_v1.md) for usage.
-
----
-
-## 3. `tds_crawler_v1.py` — vendor technical data sheet crawler
-
-Crawls every vendor listed in `Vendors_With_Technical_Sheets_By_Material_Category.xlsx`, finds the PDF links on each site, downloads the data sheets, and tags each one by document type and by the test methods it cites (ASTM, ISO, TAPPI, NWSP, IPC-TM-650, DIN, JIS).
-
-- **Seed-driven.** Domains, start URLs, path limits, JavaScript rendering and brand filters are set per vendor in `vendor_seeds.csv`.
-- **Organised output.** PDFs are filed by material category and vendor (`pdfs\<Category>\<Vendor>\`), de-duplicated by SHA-256, and listed in `tds_manifest.csv`.
-- **English first.** Translated copies are detected and the English version is preferred; foreign-only sheets are kept and flagged.
-- **Junk filtering.** Investor-relations, sustainability, press and report PDFs are filtered at crawl, link and content level; rejected files are moved, not deleted.
-- **Polite and resumable.** Obeys robots.txt, rate-limits per vendor, backs off on 429/503, and resumes after Ctrl-C.
-
-Default root: `D:\tds_corpus`, with the workbook and seed file in `D:\tds_corpus\input\`.
-
-Quick start:
-
-```
-pip install -r requirements.txt
-python tds_crawler_v1.py --list-vendors
-python tds_crawler_v1.py --discover --vendors "rogers,camden,novelis" --max-pages 60 --contact you@example.com
-python tds_crawler_v1.py --status
-python tds_crawler_v1.py --download --classify --export --vendors "rogers,camden,novelis"
-python tds_crawler_v1.py --all --contact you@example.com
-```
-
-See [`README_tds_crawler_v1.md`](README_tds_crawler_v1.md) for all options, the seed file columns and the output layout.
+- **US patents only.** Foreign patents and citations from foreign patents aren't included. (EPO and Google Patents coverage is planned; see Roadmap.)
+- **A patent is selected only if it matches a CPC code *and* a keyword** from the search matrix. That's deliberate: it keeps precision high, at the cost of missing patents with unusual wording or classification. To change what's selected, edit the workbooks, not the code.
+- **Patents before 2013 have no CPC codes**, so their older IPC codes are used instead. **Design patents have neither**, so they are almost never selected.
+- **"Process vs. product" is not recorded by USPTO.** The claim category is worked out from the wording of claim 1; about 10% can't be classified.
+- **Granted patents and published applications are separate documents.** One invention can appear twice (as its application and its grant).
+- **The nonwoven search terms pull in medical products** (wound dressings, absorbent articles, CPC A61F). They dominate the most-cited lists; filter out A61F if you only care about industrial webs.
+- **The crawler only collects public PDFs.** Data sheets behind logins, search forms or request forms are missed, and some supplier sites block crawlers. Some sites' terms forbid automated download; check before running at high volume.
+- **The workbooks are the source of truth** for CPC codes, keywords and the supplier list. Every CPC code in a workbook should have its definition sheet in the same workbook.
 
 ---
 
 ## Requirements
 
-- Python 3.9+
-- Windows is the tested platform (paths default to `D:\`); scripts use `if __name__ == "__main__":` guards for Windows `spawn`-mode multiprocessing.
-- Enough disk for the bulk USPTO archives and databases; an external drive is recommended.
-- Dependencies are listed in `requirements.txt`. Playwright is optional, for JavaScript-heavy vendor sites in the TDS crawler.
+- Windows (the scripts default to `D:\` paths; multiprocessing is written for Windows' `spawn` mode). Python 3.9 or newer.
+- Packages in [`requirements.txt`](requirements.txt). Optional: `playwright` for the crawler's `--js` mode.
+- A USPTO Open Data Portal API key for downloading patent data.
+- An external drive (an SSD helps the database stage; anything works for the rest). **Never** point the output at a OneDrive/Dropbox-synced folder: it will try to upload hundreds of GB.
 
 ## Working practice
 
-- **Stage and validate.** Run small samples (a single product, a few vendors, `--discover` dry runs) before full runs.
-- **Workbooks are authoritative.** CPC codes, keywords and the vendor list come from Excel workbooks, not from the scripts.
-- **Versioned filenames.** Each script carries its version in the filename (`_v15`, `_v1`), and its README is named to match.
+- **Stage and validate:** run a small sample first (`--sample`, `--format`, `--vendors`), look at the output, then run in full.
+- **Versions are in the file names** (`_v15`, `_v5`). The first line of each run's log or console output shows the exact version that ran.
+- **Check the logs after a run** (each README's "Checking a run" section lists what to look at).
 
 ## Data sources
 
-- USPTO Bulk Data (`bulkdata.uspto.gov`) — patent full text and metadata
-- USPTO PPUBS (`image-ppubs.uspto.gov`) — patent PDFs
-- Vendor websites listed in the vendor workbook — technical data sheets
-
-Respect each source's terms of use. Some vendor portals forbid automated download; check before running the crawler at high volume.
+- [USPTO Open Data Portal](https://data.uspto.gov/) bulk data: patent grants (APS, SGML, XML) and applications (XML), 1976 to present.
+- USPTO Patent Public Search image server: patent PDFs.
+- Supplier websites listed in the vendor workbook.
 
 ## Roadmap
 
-- International patent coverage through EPO OPS (INPADOC) and Google Patents Public Data on BigQuery
-- Directory-count mode to get exact file counts per USPTO product before large downloads
+- Non-US patents through the European Patent Office's OPS service (INPADOC, about 100 patent offices) and Google Patents Public Data (BigQuery).
+- Better claim-category word lists, using the patents currently labelled Unclassified.
+- Pull property values (thickness, tensile strength...) out of the technical data sheets into a comparison table.

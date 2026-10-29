@@ -73,7 +73,7 @@ DEFAULT_WORKBOOK = Path(r"D:\tds_corpus\input\Vendors_With_Technical_Sheets_By_M
 DEFAULT_SEEDS = Path(r"D:\tds_corpus\input\vendor_seeds.csv")
 
 USER_AGENT_BASE = "TDSCollector/1.0 (technical datasheet research)"
-BUILD = "2026-10-25 r22"        # shown at startup - tells you which version of the script actually ran
+BUILD = "2026-10-26 r25"        # shown at startup - tells you which version of the script actually ran
 RULES_VERSION = 12              # bump when classification rules change: files are re-scored automatically
                                 # (r14 paperwork rules were applied to the corpus by the 2026-10-24 audit, so
                                 #  no bump - they apply to new downloads; bump to re-check every file)
@@ -345,6 +345,12 @@ def score_link(url: str, anchor: str = "") -> int:
     return s
 
 
+# contact / sample-request / registration / login / distributor-finder / site-search pages: one per
+# product on some sites (Dow, DuPont), never holding a data sheet
+FORM_PAGE_RE = re.compile(r"contact-?us|contact-form|/contact\.html|simple-registration|registration\.html|/register\b|"
+                          r"/login|sign-?in\b|/cart\b|distributor-?finder|where-to-buy|request-(a-)?sample|"
+                          r"sample-request|/support\.html\?product=|/search\.html\?|/search\?|subscribe|"
+                          r"newsletter-signup", re.I)
 PRODUCT_PAGE_RE = re.compile(r"/p/dc?/[^/]+|/products?/[^/]+/?$|/product-detail", re.I)
 
 
@@ -874,6 +880,10 @@ class Fetcher:
             except requests.RequestException as e:
                 last_exc = e
                 STOP.wait(5 * (attempt + 1))
+            except (UnicodeError, ValueError, LookupError) as e:
+                # a malformed redirect address (non-UTF-8 bytes in the Location header, as some dow.com
+                # pages send) - treat as a failed request instead of stopping the whole vendor
+                raise requests.RequestException(f"bad response from server: {e}") from e
         raise last_exc or requests.RequestException("failed")
 
 
@@ -983,7 +993,24 @@ class VendorCrawler:
             return False
         if locale_blocked(url, self.prefix_locales):
             return False
+        if self.page_excluded(url):
+            return False
         return True
+
+    def page_excluded(self, url: str) -> bool:
+        """True when the vendor's scope_exclude (vendor_seeds.csv) matches the page address and scope_keep
+        doesn't: a whole off-topic section (DuPont /water/, 3M abrasives, Dow building & construction)
+        is then not crawled at all, instead of being crawled only for its PDFs to be thrown away."""
+        p = urlparse(url)
+        where = unquote(f"{p.path} {p.query}")
+        if FORM_PAGE_RE.search(where):
+            return True
+        exc = self.v.scope_exclude
+        if exc is None:
+            return False
+        if not exc.search(where):
+            return False
+        return not (self.v.scope_keep is not None and self.v.scope_keep.search(where))
 
     def pdf_allowed_host(self, url: str) -> bool:
         return self.args.offsite_pdfs or host_allowed(host_of(url), self.v.domains)
@@ -1192,15 +1219,29 @@ class VendorCrawler:
 
         cap = v.max_pages or self.args.max_pages
         fetched = 0
+        skipped = 0
         while self.heap and fetched < cap and not STOP.is_set():
             _, _, url, depth, score = heapq.heappop(self.heap)
-            state, code, err = self.fetch_page(url, depth)
+            if self.page_excluded(url):      # queued before the scope rule existed (or was changed)
+                self.db.execute("UPDATE pages SET state='skipped', error='out of scope / form page' WHERE url=? "
+                                "AND vendor=?",
+                                (url, v.name))
+                skipped += 1
+                continue
+            try:
+                state, code, err = self.fetch_page(url, depth)
+            except Exception as e:           # never let one odd page end the vendor's crawl
+                log.debug("[%s] page %s failed: %s", v.name, url, e)
+                state, code, err = "error", None, str(e)[:300]
             fetched += 1
             self.db.execute("UPDATE pages SET state=?, http_status=?, fetched_at=?, error=? WHERE url=? AND vendor=?",
                             (state, code, utcnow(), err, url, v.name))
             if fetched % 25 == 0:
                 log.info("[%s] %d pages fetched, %d queued, %d PDF links",
                          v.name, fetched, len(self.heap), len(self.known_pdfs))
+        if skipped:
+            log.info("[%s] skipped %d queued page(s): outside the vendor scope (scope_exclude) or contact / "
+                     "registration / search forms", v.name, skipped)
         done = 0 if (STOP.is_set() or self.heap) else 1
         self.db.execute("UPDATE vendors SET discovery_done=?, last_discovery=? WHERE vendor=?",
                         (done, utcnow(), v.name))
@@ -2960,6 +3001,9 @@ def main(argv=None):
         if args.discover:
             log.info("DISCOVER: %d vendor(s), max %d pages each, %.1fs delay, %d parallel",
                      len(active), args.max_pages, args.delay, args.workers)
+            own = [f"{v.name} {v.max_pages}" for v in active if v.max_pages]
+            if own:
+                log.info("  own page limits from vendor_seeds.csv (override --max-pages): %s", ", ".join(own))
             if args.js:
                 try:
                     import playwright  # noqa

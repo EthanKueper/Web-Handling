@@ -1,6 +1,17 @@
 """
-USPTO FORWARD-CITATION CROSS-REFERENCE  (v5)
-============================================
+USPTO FORWARD-CITATION CROSS-REFERENCE  (v5.1)
+==============================================
+
+v5.1: reads RESULTS/FILTERED\filtered_patents.csv and writes to
+    RESULTS/FORWARD CITATIONS. Patent type and claim category. The Forward Citations
+    sheet gains Patent Type, Claim Category and Independent
+    Claim Categories (carried over from filtered_patents.csv --
+    pipeline v15.10's --filter or --classify fills them). The
+    pairs sheets/CSVs gain the filtered patent's type and claim
+    category plus the CITING patent's type (Utility / Design /
+    Application ...), read from its number. Run Notes counts
+    filtered patents per claim category. No re-scan needed:
+    just --export again.
 
 v5: citation pairs split by section (APS / SGML / XML grants /
     Applications). Excel gets one pairs sheet per section, with
@@ -372,18 +383,24 @@ RESULTS_DIR = BULK_DATA_ROOT_DIR / "RESULTS"
 LOG_DIR = BULK_DATA_ROOT_DIR / "LOGS"
 
 
-FILTER_RESULTS = RESULTS_DIR / "filtered_patents.csv"
+# The main pipeline's --filter output (RESULTS\FILTERED) and
+# this script's output (RESULTS\FORWARD CITATIONS).
+FILTER_RESULTS_DIR = RESULTS_DIR / "FILTERED"
+
+FORWARD_CITATIONS_DIR = RESULTS_DIR / "FORWARD CITATIONS"
+
+FILTER_RESULTS = FILTER_RESULTS_DIR / "filtered_patents.csv"
 
 CITATION_INDEX_DB = DATABASE_DIR / "FORWARD_CITATIONS.sqlite"
 
-FORWARD_CITATION_XLSX = RESULTS_DIR / "forward_citations.xlsx"
+FORWARD_CITATION_XLSX = FORWARD_CITATIONS_DIR / "forward_citations.xlsx"
 
 FORWARD_CITATION_PAIRS_CSV = (
-    RESULTS_DIR / "forward_citation_pairs.csv"
+    FORWARD_CITATIONS_DIR / "forward_citation_pairs.csv"
 )
 
 FORWARD_CITATION_VERIFY_CSV = (
-    RESULTS_DIR / "forward_citation_match_report.csv"
+    FORWARD_CITATIONS_DIR / "forward_citation_match_report.csv"
 )
 
 
@@ -571,6 +588,82 @@ def _canonical_key(raw_number, aps_wku=False):
     keys = _canonical_keys(raw_number, aps_wku=aps_wku)
 
     return keys[0] if keys else None
+
+
+# ============================================================
+# PATENT TYPE  (v5.1)
+# ============================================================
+#
+# Same rules as classify_patent_type() in
+# uspto_patent_pipeline_v15.py (kept as a copy so this script
+# still runs standalone). Used for citing patents, which only
+# come with a number, and as a fallback for filtered patents
+# when filtered_patents.csv predates the patent_type column.
+
+PATENT_TYPE_UTILITY = "Utility"
+PATENT_TYPE_DESIGN = "Design"
+PATENT_TYPE_PLANT = "Plant"
+PATENT_TYPE_REISSUE = "Reissue"
+PATENT_TYPE_SIR = "Statutory Invention Registration (SIR)"
+PATENT_TYPE_DEFENSIVE = "Defensive Publication"
+PATENT_TYPE_APPLICATION = "Application (utility)"
+PATENT_TYPE_PLANT_APPLICATION = "Application (plant)"
+
+_patent_type_cache = {}
+
+
+def classify_patent_type(number, document_type=None):
+
+    """Utility / Design / Plant / Reissue / SIR / Defensive
+    Publication / Application, from the number and kind code."""
+
+    cache_key = (number, document_type)
+
+    cached = _patent_type_cache.get(cache_key)
+
+    if cached is not None:
+        return cached
+
+    value = (number or "").strip().upper()
+
+    if value.startswith("US"):
+        value = value[2:]
+
+    value = re.sub(r"[^A-Z0-9]", "", value)
+
+    doc_type = (document_type or "").strip().lower()
+
+    application_match = re.match(r"^(\d{11})([A-Z]\d?)?$", value)
+
+    if doc_type == "application" or (
+        application_match is not None
+        and 1900 <= int(value[:4]) <= 2100
+    ):
+        kind = application_match.group(2) if application_match else ""
+        result = (
+            PATENT_TYPE_PLANT_APPLICATION
+            if (kind or "").startswith("P")
+            else PATENT_TYPE_APPLICATION
+        )
+    elif value.startswith("PP"):
+        result = PATENT_TYPE_PLANT
+    elif value.startswith("RE"):
+        result = PATENT_TYPE_REISSUE
+    elif value.startswith("D"):
+        result = PATENT_TYPE_DESIGN
+    elif value.startswith("H") or doc_type == "sir":
+        result = PATENT_TYPE_SIR
+    elif value.startswith("T"):
+        result = PATENT_TYPE_DEFENSIVE
+    elif value[:1].isdigit():
+        result = PATENT_TYPE_UTILITY
+    else:
+        result = ""
+
+    if len(_patent_type_cache) < 2_000_000:
+        _patent_type_cache[cache_key] = result
+
+    return result
 
 
 # ============================================================
@@ -1761,6 +1854,18 @@ def load_filtered_patents():
                     row.get("publication_number") or ""
                 ).strip(),
                 "title": (row.get("title") or "").strip(),
+                "patent_type": (
+                    (row.get("patent_type") or "").strip()
+                    or classify_patent_type(
+                        patent_number, row.get("document_type")
+                    )
+                ),
+                "claim_category": (
+                    row.get("claim_category") or ""
+                ).strip(),
+                "independent_claim_categories": (
+                    row.get("independent_claim_categories") or ""
+                ).strip(),
                 "grant_date": grant_date,
                 "publication_date": (
                     row.get("publication_date") or ""
@@ -2303,14 +2408,17 @@ def export_results():
     # LONG-FORMAT CSV  (authoritative, unlimited)
     # --------------------------------------------------------
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    FORWARD_CITATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
     pair_count = 0
 
     pairs_header = [
         "filtered_patent_number",
+        "filtered_patent_type",
+        "filtered_claim_category",
         "canonical_key",
         "citing_patent_number",
+        "citing_patent_type",
         "citing_patent_date",
         "citation_category",
         "filtered_patent_title",
@@ -2318,7 +2426,7 @@ def export_results():
 
     # Remove per-section files from an earlier export first, so a
     # stale "_part3" from a bigger previous run can't linger.
-    for old_file in RESULTS_DIR.glob(
+    for old_file in FORWARD_CITATIONS_DIR.glob(
         FORWARD_CITATION_PAIRS_CSV.stem + "_*" + FORWARD_CITATION_PAIRS_CSV.suffix
     ):
         try:
@@ -2347,8 +2455,11 @@ def export_results():
 
                 row = [
                     record["patent_number"],
+                    record["patent_type"],
+                    record["claim_category"],
                     key,
                     citing_number,
+                    classify_patent_type(citing_number),
                     citing_date,
                     category,
                     record["title"],
@@ -2527,6 +2638,9 @@ def export_results():
     header = [
         "Filtered Patent ID",
         "Title",
+        "Patent Type",
+        "Claim Category",
+        "Independent Claim Categories",
         "Grant Date",
         "Assignee",
         "CPC",
@@ -2562,6 +2676,9 @@ def export_results():
         out = [
             record["patent_number"],
             record["title"],
+            record["patent_type"],
+            record["claim_category"],
+            record["independent_claim_categories"],
             record["grant_date"] or record["publication_date"],
             record["assignees"],
             record["cpc"],
@@ -2603,7 +2720,10 @@ def export_results():
 
         pairs_header = [
             "Filtered Patent ID",
+            "Filtered Patent Type",
+            "Filtered Claim Category",
             "Citing Patent ID",
+            "Citing Patent Type",
             "Citing Patent Date",
             "Citation Category",
         ]
@@ -2648,7 +2768,10 @@ def export_results():
 
                     sheet.append([
                         record["patent_number"],
+                        record["patent_type"],
+                        record["claim_category"],
                         citing_number,
+                        classify_patent_type(citing_number),
                         citing_date,
                         category,
                     ])
@@ -2761,6 +2884,47 @@ def export_results():
         "there directly if you want to build your own curve "
         "(e.g. citations binned by year-since-grant) instead."
     ])
+
+    notes.append([])
+    notes.append(["PATENT TYPE AND CLAIM CATEGORY"])
+    notes.append([
+        "'Patent Type' is the USPTO document type, read from the "
+        "number/kind code (Utility, Design, Plant, Reissue, SIR, "
+        "Defensive Publication, Application)."
+    ])
+    notes.append([
+        "'Claim Category' is what claim 1 claims -- Process / Method, "
+        "Apparatus / System, Product / Article, Composition, "
+        "Product-by-process, Design, Plant -- read from the claim's "
+        "preamble by the main pipeline (a heuristic: USPTO does not "
+        "record it). 'Independent Claim Categories' lists every "
+        "category across the independent claims."
+    ])
+    notes.append([
+        "'Citing Patent Type' (pairs) is read from the citing "
+        "patent's number only."
+    ])
+
+    category_counts = defaultdict(int)
+    category_cited = defaultdict(int)
+
+    for row in summary_rows:
+        label = row["record"]["claim_category"] or "(blank)"
+        category_counts[label] += 1
+        category_cited[label] += row["count"]
+
+    if set(category_counts) == {"(blank)"}:
+        notes.append([
+            "Claim Category is blank: filtered_patents.csv predates "
+            "pipeline v15.10. Run the pipeline's --classify, then "
+            "--export here again."
+        ])
+    else:
+        notes.append(["Claim category", "Filtered patents", "Total times cited"])
+        for label, count in sorted(
+            category_counts.items(), key=lambda item: -item[1]
+        ):
+            notes.append([label, count, category_cited[label]])
 
     if not EXCEL_INCLUDE_PAIRS_SHEET:
         notes.append([])
@@ -2935,6 +3099,8 @@ def verify():
     both_hits = 0
     no_hits = 0
     ambiguous = []
+
+    FORWARD_CITATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
     with open(
         FORWARD_CITATION_VERIFY_CSV,
